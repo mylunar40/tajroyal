@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "31779633480",
+    "project_id": "taj-royal-c25cb",
+    "storage_bucket": "taj-royal-c25cb.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:31779633480:android:fca2198f9fb0ab6026db7d",
+        "android_client_info": {
+          "package_name": "com.example.taj_royal_contract"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDoaQQ3F0l5JEoHnmxrFCbWyzdf-nanES4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

@@ -1,0 +1,58 @@
+name: taaj_royal_contract
+description: Taaj Royal Contract App
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.2.0 <4.0.0"
+  flutter: ">=3.16.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+
+  # PDF & Printing
+  pdf: ^3.11.1
+  printing: ^5.13.0
+
+  # Fonts
+  google_fonts: ^6.2.1
+
+  # Sharing & Files
+  share_plus: ^10.0.2
+  cross_file: ^0.3.4+2
+  path_provider: ^2.1.4
+
+  # Firebase
+  firebase_core: ^3.6.0
+  firebase_auth: ^5.3.1
+  cloud_firestore: ^5.4.4
+  google_sign_in: ^6.2.1
+
+  # UI & Charts
+  fl_chart: ^0.70.0
+  font_awesome_flutter: ^10.8.0
+
+  # Utils
+  shared_preferences: ^2.3.0
+  intl: ^0.19.0
+  translator: ^1.0.4
+  qr_flutter: ^4.1.0
+  http: ^1.2.2
+  hand_signature: ^3.1.0+2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/logo.png
+    - assets/qr.png
+    - assets/sing.png
+    - assets/stamp.png
