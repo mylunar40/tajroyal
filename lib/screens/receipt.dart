@@ -1,17 +1,19 @@
-﻿import 'dart:convert';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:async';
 import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
+import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:http/http.dart' as http;
 import 'package:google_fonts/google_fonts.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:printing/printing.dart';
 import 'package:share_plus/share_plus.dart';
-
+import 'package:cloud_firestore/cloud_firestore.dart';
 import '../widgets/sidebar.dart';
+import 'dashboard.dart';
 
 import '../services/data_service.dart';
 import '../services/browser_file_download.dart';
@@ -51,14 +53,16 @@ class _ReceiptState extends State<Receipt> {
   static const double _maxZoom = 2.2;
   static const double _zoomStep = 0.15;
   static const double _receiptCardWidth = 640;
-  static const double _receiptCardHeight = 490;
+  static const double _receiptCardHeight = 527;
   final GlobalKey _viewerAreaKey = GlobalKey();
   Size _lastViewerSize = Size.zero;
+  bool _initialZoomSet = false;
   double _inputFontSize = 10;
   bool _isInputBold = false;
   bool _isInputItalic = false;
   bool _isInputUnderline = false;
   String _inputFontStyle = 'Roboto';
+  Color _receiptBgColor = Colors.white;
   // Approx 4mm spacing in logical pixels for on-screen layout.
   static const double _twoMmGap = 11.4;
 
@@ -86,7 +90,6 @@ class _ReceiptState extends State<Receipt> {
     final effectiveStyle = _isInputItalic ? FontStyle.italic : FontStyle.normal;
     final effectiveDecoration =
         _isInputUnderline ? TextDecoration.underline : TextDecoration.none;
-
     switch (_inputFontStyle) {
       case 'Poppins':
         return GoogleFonts.poppins(
@@ -219,21 +222,33 @@ class _ReceiptState extends State<Receipt> {
   final _kdController = TextEditingController();
   final _filsController = TextEditingController();
   final _noController = TextEditingController();
+  final _receiptNoController = TextEditingController();
   final _historySearchController = TextEditingController();
   int? _editingReceiptIndex;
+  int? _hoveredReceiptIndex;
+  bool _showSignature = false;
+  Timer? _mobileDebounce;
 
   final TextEditingController _dateController = TextEditingController(
     text:
         "${DateTime.now().day}/${DateTime.now().month}/${DateTime.now().year}",
   );
 
+  final TextEditingController _receiverNameController = TextEditingController();
+
+  // Firebase instance
+  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+
   @override
   void initState() {
     super.initState();
+    _noController.text = "0001"; // contract no auto later
+    _receiptNoController.text = "1";
     _attachFieldListeners();
+    _loadReceiptsFromFirebase();
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      _setZoom(1.0);
       _schedulePdfWarmup();
+      _resetZoom(); // center receipt preview on first frame
 
       final initialIndex = widget.initialHistoryIndex;
       if (initialIndex != null &&
@@ -265,6 +280,7 @@ class _ReceiptState extends State<Receipt> {
     }
     _kdController.addListener(_onAmountChanged);
     _filsController.addListener(_onAmountChanged);
+    _mobileController.addListener(_onMobileFieldChanged);
   }
 
   void _detachFieldListeners() {
@@ -285,11 +301,50 @@ class _ReceiptState extends State<Receipt> {
     }
     _kdController.removeListener(_onAmountChanged);
     _filsController.removeListener(_onAmountChanged);
+    _mobileController.removeListener(_onMobileFieldChanged);
   }
 
   void _onFormChanged() {
     _invalidatePdfCache();
     _schedulePdfWarmup();
+  }
+
+  void _onMobileFieldChanged() {
+    _mobileDebounce?.cancel();
+    _mobileDebounce = Timer(const Duration(milliseconds: 900), () {
+      _autoFillReceiptNumber();
+    });
+  }
+
+  Future<void> _autoFillReceiptNumber() async {
+    final mobile = _mobileController.text.trim();
+    if (mobile.isEmpty) return;
+    // Skip auto-fill when editing an existing receipt
+    if (_editingReceiptIndex != null) return;
+    try {
+      final existingSnap = await _firestore
+          .collection('receipts')
+          .where('mobile', isEqualTo: mobile)
+          .limit(1)
+          .get();
+      if (existingSnap.docs.isEmpty) return;
+      final contractNo =
+          (existingSnap.docs.first.data()['contractNo'] as String?) ?? '';
+      if (contractNo.isEmpty) return;
+      final countSnap = await _firestore
+          .collection('receipts')
+          .where('contractNo', isEqualTo: contractNo)
+          .get();
+      final nextReceiptNo = countSnap.docs.length + 1;
+      if (mounted) {
+        setState(() {
+          _noController.text = contractNo.replaceAll('CT-', '');
+          _receiptNoController.text = nextReceiptNo.toString();
+        });
+      }
+    } catch (_) {
+      // Non-critical � user can still save manually
+    }
   }
 
   void _invalidatePdfCache() {
@@ -402,8 +457,22 @@ class _ReceiptState extends State<Receipt> {
     ].join('|');
   }
 
+  /// Returns a safe PDF filename: CustomerName_Receipt_DD-MM-YYYY.pdf
+  String _receiptPdfFileName() {
+    final rawName = _receivedFromController.text.trim();
+    final safeName = rawName.isEmpty
+        ? 'Customer'
+        : rawName.replaceAll(RegExp(r'[\\/:*?"<>|]'), '').replaceAll(' ', '_');
+    final rawDate = _dateController.text.trim(); // DD/M/YYYY
+    final parts = rawDate.split('/');
+    final dateStr = parts.length == 3
+        ? '${parts[0].padLeft(2, '0')}-${parts[1].padLeft(2, '0')}-${parts[2]}'
+        : rawDate.replaceAll('/', '-');
+    return '${safeName}_Receipt_$dateStr.pdf';
+  }
+
   Future<Uint8List> _captureReceiptAsPng() async {
-    await Future.delayed(const Duration(milliseconds: 300));
+    await Future.delayed(const Duration(milliseconds: 200));
     await WidgetsBinding.instance.endOfFrame;
 
     final boundary = _receiptBoundaryKey.currentContext?.findRenderObject()
@@ -450,11 +519,19 @@ class _ReceiptState extends State<Receipt> {
   }
 
   Future<Uint8List> _getPdfBytes() async {
+    final currentKey = _currentPdfDataKey();
+    if (_cachedPdfBytes != null && _cachedPdfKey == currentKey) {
+      return _cachedPdfBytes!;
+    }
     final pngBytes = await _captureReceiptAsPng();
     final pdf = _buildPdfFromImage(pngBytes);
-    return await pdf.save();
+    final bytes = await pdf.save();
+    _cachedPdfBytes = bytes;
+    _cachedPdfKey = currentKey;
+    return bytes;
   }
 
+  // ignore: unused_element
   Future<Uint8List> _buildDirectPdfBytes() async {
     return _getPdfBytes();
   }
@@ -468,8 +545,9 @@ class _ReceiptState extends State<Receipt> {
         pageFormat: _receiptPageFormat,
         margin: pw.EdgeInsets.zero,
         build: (pw.Context context) {
-          return pw.Center(
-            child: pw.Image(receiptImage, fit: pw.BoxFit.contain),
+          return pw.FittedBox(
+            fit: pw.BoxFit.fill,
+            child: pw.Image(receiptImage),
           );
         },
       ),
@@ -546,7 +624,7 @@ class _ReceiptState extends State<Receipt> {
                     style: const pw.TextStyle(fontSize: 10),
                   ),
                   pw.Text(
-                    'No: ${_noController.text}',
+                    'No: CT-${_noController.text}',
                     style: const pw.TextStyle(fontSize: 10),
                   ),
                 ],
@@ -589,7 +667,7 @@ class _ReceiptState extends State<Receipt> {
               pw.SizedBox(height: 8),
               pw.Text(
                 'Being For: ${_beingForController.text}',
-                style: const pw.TextStyle(fontSize: 11),
+                style: pw.TextStyle(fontSize: 11),
               ),
               pw.Spacer(),
               pw.Row(
@@ -597,10 +675,22 @@ class _ReceiptState extends State<Receipt> {
                 children: [
                   pw.Column(
                     children: [
+                      // ?? Editable field ka text PDF me show hoga
+                      pw.Text(
+                        _receiverNameController.text.isEmpty
+                            ? ' '
+                            : _receiverNameController.text,
+                        style: pw.TextStyle(
+                          fontSize: 11,
+                          fontWeight: pw.FontWeight.bold,
+                        ),
+                      ),
+
                       pw.Text('__________________________'),
+
                       pw.Text(
                         "Receiver's Name / اسم المستلم",
-                        style: const pw.TextStyle(fontSize: 9),
+                        style: pw.TextStyle(fontSize: 9),
                       ),
                     ],
                   ),
@@ -638,6 +728,7 @@ class _ReceiptState extends State<Receipt> {
   @override
   void dispose() {
     _warmupDebounce?.cancel();
+    _mobileDebounce?.cancel();
     _detachFieldListeners();
     _receivedFromController.dispose();
     _mobileController.dispose();
@@ -648,19 +739,25 @@ class _ReceiptState extends State<Receipt> {
     _kdController.dispose();
     _filsController.dispose();
     _noController.dispose();
+    _receiptNoController.dispose();
     _dateController.dispose();
     _historySearchController.dispose();
     _zoomController.dispose();
     super.dispose();
   }
 
-  void _setZoom(double nextScale) {
+  void _setZoom(double nextScale, {Size? viewerSize}) {
     final clamped = nextScale.clamp(_minZoom, _maxZoom).toDouble();
-    final renderObject = _viewerAreaKey.currentContext?.findRenderObject();
-    if (renderObject is RenderBox && renderObject.hasSize) {
-      final viewerSize = renderObject.size;
-      final dx = (viewerSize.width - (_receiptCardWidth * clamped)) / 2;
-      final dy = (viewerSize.height - (_receiptCardHeight * clamped)) / 2;
+    Size? size = viewerSize;
+    if (size == null) {
+      final renderObject = _viewerAreaKey.currentContext?.findRenderObject();
+      if (renderObject is RenderBox && renderObject.hasSize) {
+        size = renderObject.size;
+      }
+    }
+    if (size != null) {
+      final dx = (size.width - (_receiptCardWidth * clamped)) / 2;
+      final dy = (size.height - (_receiptCardHeight * clamped)) / 2;
       _zoomController.value = Matrix4.identity()
         ..translate(dx, dy)
         ..scaleByDouble(clamped, clamped, 1, 1);
@@ -686,7 +783,19 @@ class _ReceiptState extends State<Receipt> {
   }
 
   void _resetZoom() {
-    _setZoom(1.0);
+    final renderObject = _viewerAreaKey.currentContext?.findRenderObject();
+    Size? viewerSize;
+    if (renderObject is RenderBox && renderObject.hasSize) {
+      viewerSize = renderObject.size;
+    }
+    final effectiveWidth =
+        viewerSize?.width ?? MediaQuery.of(context).size.width;
+    if (effectiveWidth < 900) {
+      final fitZoom = (effectiveWidth / _receiptCardWidth).clamp(_minZoom, 1.0);
+      _setZoom(fitZoom, viewerSize: viewerSize);
+    } else {
+      _setZoom(1.0, viewerSize: viewerSize);
+    }
   }
 
   Future<void> _printReceipt() async {
@@ -703,13 +812,19 @@ class _ReceiptState extends State<Receipt> {
   }
 
   Future<void> _savePdf() async {
+    await saveReceiptToFirebase();
+
     try {
       final bytes = await _getPdfBytes();
       final name = 'receipt_${_dateController.text.replaceAll('/', '-')}.pdf';
 
       if (kIsWeb) {
+        await downloadPdfBytes(bytes, name);
         _saveReceiptHistory();
         if (mounted) {
+          setState(() {
+            _editingReceiptIndex = null;
+          });
           ScaffoldMessenger.of(
             context,
           ).showSnackBar(const SnackBar(content: Text('Saved successfully')));
@@ -743,33 +858,16 @@ class _ReceiptState extends State<Receipt> {
 
   Future<void> _downloadPdf() async {
     try {
-      // Capture receipt widget as high-res PNG image
-      final boundary = _receiptBoundaryKey.currentContext!.findRenderObject()
-          as RenderRepaintBoundary;
-      final image = await boundary.toImage(pixelRatio: 3.0);
-      final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
-      final pngBytes = byteData!.buffer.asUint8List();
-      final base64Image = base64Encode(pngBytes);
-
-      // Send to Firebase Cloud Function and get PDF back
-      const functionUrl =
-          'https://us-central1-taj-royal-c25cb.cloudfunctions.net/generateReceiptPdf';
-      final response = await http.post(
-        Uri.parse(functionUrl),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({'image': base64Image}),
-      );
-
-      if (response.statusCode != 200) {
-        throw Exception('Server error: ${response.statusCode}');
-      }
-
-      final pdfBytes = response.bodyBytes;
-      final dateStr = _dateController.text.replaceAll('/', '-');
-      final name = 'receipt$dateStr.pdf';
+      final pdfBytes = await _getPdfBytes();
+      final name = _receiptPdfFileName();
 
       if (kIsWeb) {
         await downloadPdfBytes(pdfBytes, name);
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Receipt PDF downloaded')),
+          );
+        }
         return;
       }
 
@@ -781,14 +879,14 @@ class _ReceiptState extends State<Receipt> {
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('PDF saved: ${file.path}')),
+          SnackBar(content: Text('Receipt PDF saved: ${file.path}')),
         );
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Download failed: $e')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Download failed: $e')),
+        );
       }
     }
   }
@@ -796,20 +894,28 @@ class _ReceiptState extends State<Receipt> {
   Future<void> _sharePdf() async {
     try {
       final bytes = await _getPdfBytes();
-      final name = 'receipt_${_dateController.text.replaceAll('/', '-')}.pdf';
+      final name = _receiptPdfFileName();
 
       if (kIsWeb) {
-        await sharePdfWeb(bytes);
-        return;
+        // Try Web Share API via share_plus; fallback to download if unsupported
+        try {
+          await Share.shareXFiles(
+            [XFile.fromData(bytes, mimeType: 'application/pdf', name: name)],
+            text: 'Receipt from Taj Royal Glass Co.',
+          );
+        } catch (_) {
+          await downloadPdfBytes(bytes, name);
+        }
+      } else {
+        // Mobile / Desktop: pehle file save, phir native share sheet
+        final dir = await getTemporaryDirectory();
+        final file = File('${dir.path}/$name');
+        await file.writeAsBytes(bytes);
+        await Share.shareXFiles(
+          [XFile(file.path)],
+          text: 'Receipt from Taj Royal Glass Co.',
+        );
       }
-
-      final dir = await getTemporaryDirectory();
-      final file = File('${dir.path}/$name');
-      await file.writeAsBytes(bytes);
-      await Share.shareXFiles(
-        [XFile(file.path)],
-        text: 'Receipt from Taj Royal Glass',
-      );
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(
@@ -853,6 +959,190 @@ class _ReceiptState extends State<Receipt> {
     DataService.receipts.add(entry);
   }
 
+  Future<void> _loadReceiptsFromFirebase() async {
+    try {
+      final snapshot = await _firestore.collection('receipts').get();
+      DataService.receipts.clear();
+
+      for (var doc in snapshot.docs) {
+        final data = doc.data();
+        DataService.receipts.add({
+          'name': data['name'] ?? '',
+          'mobile': data['mobile'] ?? '',
+          'amount': data['amount'] ?? '',
+          'date': data['date'] ?? '',
+          'contractNo': data['contractNo'] ?? '',
+          'receiptNo': data['receiptNo'] ?? '',
+          'fullNo': data['fullNo'] ?? '',
+          'bank': data['bank'] ?? '',
+          'chequeNo': data['chequeNo'] ?? '',
+          'beingFor': data['beingFor'] ?? '',
+          'kd': data['amount'] ?? '',
+          'fils': data.containsKey('fils') ? data['fils'] : '',
+          'sum': data.containsKey('sum') ? data['sum'] : '',
+          'no': data['contractNo']?.replaceAll('CT-', '') ?? '',
+          'receiverName': data['receiverName'] ?? '',
+        });
+      }
+
+      if (mounted) {
+        setState(() {});
+      }
+    } catch (e) {
+      debugPrint('Error loading receipts: $e');
+    }
+  }
+
+  Future<void> saveReceiptToFirebase() async {
+    try {
+      final name = _receivedFromController.text.trim();
+      final mobile = _mobileController.text.trim();
+
+      // Check if editing an existing receipt that has a Firestore doc
+      final editingIndex = _editingReceiptIndex;
+      final existingFirestoreId = (editingIndex != null &&
+              editingIndex >= 0 &&
+              editingIndex < DataService.receipts.length)
+          ? DataService.receipts[editingIndex]['firestoreId']?.toString()
+          : null;
+
+      if (existingFirestoreId != null && existingFirestoreId.isNotEmpty) {
+        // UPDATE existing Firestore document — no duplicate
+        final updateData = {
+          'name': name,
+          'mobile': mobile,
+          'amount': _kdController.text.trim(),
+          'date': _dateController.text.trim(),
+          'bank': _bankController.text.trim(),
+          'chequeNo': _chequeController.text.trim(),
+          'beingFor': _beingForController.text.trim(),
+          'receiverName': _receiverNameController.text.trim(),
+          'fils': _filsController.text.trim(),
+          'sum': _sumController.text.trim(),
+          'updatedAt': FieldValue.serverTimestamp(),
+        };
+        await _firestore
+            .collection('receipts')
+            .doc(existingFirestoreId)
+            .update(updateData);
+
+        // Update local DataService entry
+        DataService.receipts[editingIndex!] = {
+          ...DataService.receipts[editingIndex],
+          'name': name,
+          'mobile': mobile,
+          'amount': _kdController.text.trim(),
+          'date': _dateController.text.trim(),
+          'bank': _bankController.text.trim(),
+          'cheque': _chequeController.text.trim(),
+          'beingFor': _beingForController.text.trim(),
+          'receiverName': _receiverNameController.text.trim(),
+          'fils': _filsController.text.trim(),
+          'sum': _sumController.text.trim(),
+          'kd': _kdController.text.trim(),
+        };
+
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Receipt updated')),
+          );
+        }
+        return;
+      }
+
+      // NEW receipt — create new Firestore document
+      String contractNo = '';
+      int receiptNo = 1;
+
+      if (mobile.isNotEmpty) {
+        // Look for any existing receipt from this mobile number
+        final existingSnap = await _firestore
+            .collection('receipts')
+            .where('mobile', isEqualTo: mobile)
+            .limit(1)
+            .get();
+        if (existingSnap.docs.isNotEmpty) {
+          contractNo =
+              (existingSnap.docs.first.data()['contractNo'] as String?) ?? '';
+        }
+      }
+
+      if (contractNo.isEmpty) {
+        // New customer — assign next CT-XXXX via Firestore counter
+        final counterRef = _firestore.collection('counters').doc('mainCounter');
+        final counterSnap = await counterRef.get();
+        int lastNo = counterSnap.exists
+            ? ((counterSnap['lastContractNo'] ?? 0) as int)
+            : 0;
+        lastNo++;
+        await counterRef.set({'lastContractNo': lastNo});
+        contractNo = 'CT-${lastNo.toString().padLeft(4, '0')}';
+      }
+
+      // Count existing receipts for this contractNo — receipt sequence number
+      final countSnap = await _firestore
+          .collection('receipts')
+          .where('contractNo', isEqualTo: contractNo)
+          .get();
+      receiptNo = countSnap.docs.length + 1;
+
+      final fullNo = '$contractNo / R$receiptNo';
+
+      final docRef = await _firestore.collection('receipts').add({
+        'contractNo': contractNo,
+        'receiptNo': receiptNo.toString(),
+        'fullNo': fullNo,
+        'name': name,
+        'mobile': mobile,
+        'amount': _kdController.text.trim(),
+        'date': _dateController.text.trim(),
+        'bank': _bankController.text.trim(),
+        'chequeNo': _chequeController.text.trim(),
+        'beingFor': _beingForController.text.trim(),
+        'receiverName': _receiverNameController.text.trim(),
+        'fils': _filsController.text.trim(),
+        'sum': _sumController.text.trim(),
+        'timestamp': FieldValue.serverTimestamp(),
+      });
+
+      // Keep DataService.receipts in sync so Dashboard shows fresh data
+      final newEntry = {
+        'firestoreId': docRef.id,
+        'name': name,
+        'mobile': mobile,
+        'amount': _kdController.text.trim(),
+        'date': _dateController.text.trim(),
+        'contractNo': contractNo,
+        'receiptNo': receiptNo.toString(),
+        'fullNo': fullNo,
+        'bank': _bankController.text.trim(),
+        'cheque': _chequeController.text.trim(),
+        'beingFor': _beingForController.text.trim(),
+        'kd': _kdController.text.trim(),
+        'fils': _filsController.text.trim(),
+        'sum': _sumController.text.trim(),
+        'no': contractNo.replaceAll('CT-', ''),
+        'receiverName': _receiverNameController.text.trim(),
+      };
+      DataService.receipts.insert(0, newEntry);
+
+      if (mounted) {
+        setState(() {
+          _noController.text = contractNo.replaceAll('CT-', '');
+          _receiptNoController.text = receiptNo.toString();
+        });
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Saved: $fullNo')),
+      );
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Error: $e')),
+      );
+    }
+  }
+
   List<Map<String, dynamic>> _filteredReceipts() {
     final query = _historySearchController.text.trim().toLowerCase();
     final source = DataService.receipts.reversed.toList();
@@ -866,10 +1156,16 @@ class _ReceiptState extends State<Receipt> {
       final mobile = (receipt['mobile'] ?? '').toString().toLowerCase();
       final amount = (receipt['amount'] ?? '').toString().toLowerCase();
       final date = (receipt['date'] ?? '').toString().toLowerCase();
+      final receiptNo = (receipt['no'] ?? '').toString().toLowerCase();
+      final cheque = (receipt['cheque'] ?? '').toString().toLowerCase();
+      final beingFor = (receipt['beingFor'] ?? '').toString().toLowerCase();
       return name.contains(query) ||
           mobile.contains(query) ||
           amount.contains(query) ||
-          date.contains(query);
+          date.contains(query) ||
+          receiptNo.contains(query) ||
+          cheque.contains(query) ||
+          beingFor.contains(query);
     }).toList();
   }
 
@@ -889,6 +1185,11 @@ class _ReceiptState extends State<Receipt> {
     });
   }
 
+  String _nextReceiptNumber() {
+    final count = DataService.receipts.length + 1;
+    return count.toString().padLeft(4, '0');
+  }
+
   void _startNewReceipt() {
     setState(() {
       _editingReceiptIndex = null;
@@ -900,7 +1201,7 @@ class _ReceiptState extends State<Receipt> {
       _beingForController.clear();
       _kdController.clear();
       _filsController.clear();
-      _noController.clear();
+      _noController.text = _nextReceiptNumber();
       final now = DateTime.now();
       _dateController.text = '${now.day}/${now.month}/${now.year}';
     });
@@ -933,228 +1234,1145 @@ class _ReceiptState extends State<Receipt> {
       return;
     }
 
-    setState(() {
-      DataService.receipts.removeAt(sourceIndex);
-      if (_editingReceiptIndex == sourceIndex) {
-        _editingReceiptIndex = null;
-      } else if (_editingReceiptIndex != null &&
-          _editingReceiptIndex! > sourceIndex) {
-        _editingReceiptIndex = _editingReceiptIndex! - 1;
+    try {
+      final receipt = DataService.receipts[sourceIndex];
+      final firestoreId = receipt['firestoreId']?.toString() ?? '';
+      final fullNo = receipt['fullNo']?.toString() ?? '';
+
+      // Delete from Firebase — prefer direct doc delete, fallback to fullNo query
+      if (firestoreId.isNotEmpty) {
+        await _firestore.collection('receipts').doc(firestoreId).delete();
+      } else if (fullNo.isNotEmpty) {
+        final snapshot = await _firestore
+            .collection('receipts')
+            .where('fullNo', isEqualTo: fullNo)
+            .get();
+        for (var doc in snapshot.docs) {
+          await doc.reference.delete();
+        }
       }
-    });
+
+      setState(() {
+        DataService.receipts.removeAt(sourceIndex);
+        if (_editingReceiptIndex == sourceIndex) {
+          _editingReceiptIndex = null;
+        } else if (_editingReceiptIndex != null &&
+            _editingReceiptIndex! > sourceIndex) {
+          _editingReceiptIndex = _editingReceiptIndex! - 1;
+        }
+      });
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Receipt deleted successfully')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Delete failed: $e')),
+        );
+      }
+    }
   }
 
   Widget _buildHistoryPanel({double width = 300, bool compact = false}) {
     final receipts = _filteredReceipts();
 
-    return Container(
-      width: width,
-      color: Colors.white,
-      padding: EdgeInsets.all(compact ? 10 : 12),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            'Receipt History',
-            style: TextStyle(
-              fontSize: compact ? 16 : 18,
-              fontWeight: FontWeight.bold,
-              color: const Color(0xFF0D47A1),
-            ),
-          ),
-          SizedBox(height: compact ? 8 : 10),
-          if (_editingReceiptIndex != null)
-            Container(
-              width: double.infinity,
-              margin: EdgeInsets.only(bottom: compact ? 8 : 10),
-              padding: EdgeInsets.symmetric(
-                horizontal: compact ? 8 : 10,
-                vertical: compact ? 6 : 8,
-              ),
-              decoration: BoxDecoration(
-                color: const Color(0xFFE8F0FF),
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(
-                  color: const Color(0xFF0D47A1).withValues(alpha: 0.2),
-                ),
-              ),
-              child: Row(
+    // -- MOBILE / COMPACT branch (bottom-sheet) � unchanged ----------
+    if (compact) {
+      return Container(
+        width: width,
+        color: Colors.white,
+        padding: const EdgeInsets.all(10),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  const Expanded(
-                    child: Text(
-                      'Edit mode is active',
-                      style: TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.w700,
-                        color: Color(0xFF0D47A1),
+                  Row(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(6),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF0D47A1).withValues(alpha: 0.1),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: const Icon(Icons.receipt_long,
+                            color: Color(0xFF0D47A1), size: 16),
+                      ),
+                      const SizedBox(width: 8),
+                      const Text(
+                        'Receipt History',
+                        style: TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w800,
+                          color: Color(0xFF0D47A1),
+                          letterSpacing: -0.3,
+                        ),
+                      ),
+                      const Spacer(),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 8, vertical: 3),
+                        decoration: BoxDecoration(
+                          color:
+                              const Color(0xFF0D47A1).withValues(alpha: 0.09),
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: Text(
+                          '${receipts.length}',
+                          style: const TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w700,
+                            color: Color(0xFF0D47A1),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  if (_editingReceiptIndex != null)
+                    Container(
+                      width: double.infinity,
+                      margin: const EdgeInsets.only(bottom: 8),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 8, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFE8F0FF),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(
+                            color:
+                                const Color(0xFF0D47A1).withValues(alpha: 0.2)),
+                      ),
+                      child: Row(
+                        children: [
+                          const Expanded(
+                            child: Text('Edit mode is active',
+                                style: TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w700,
+                                    color: Color(0xFF0D47A1))),
+                          ),
+                          TextButton(
+                              onPressed: _startNewReceipt,
+                              child: const Text('Cancel')),
+                        ],
+                      ),
+                    ),
+                  TextField(
+                    controller: _historySearchController,
+                    onChanged: (_) => setState(() {}),
+                    decoration: InputDecoration(
+                      hintText: 'Search receipts�',
+                      hintStyle:
+                          TextStyle(color: Colors.grey[400], fontSize: 12),
+                      prefixIcon: const Icon(Icons.search,
+                          size: 18, color: Color(0xFF0D47A1)),
+                      isDense: true,
+                      filled: true,
+                      fillColor: const Color(0xFFF0F4FF),
+                      contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 10, vertical: 9),
+                      border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(10),
+                          borderSide: BorderSide.none),
+                      focusedBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(10),
+                        borderSide: const BorderSide(
+                            color: Color(0xFF0D47A1), width: 1.5),
                       ),
                     ),
                   ),
-                  TextButton(
-                    onPressed: _startNewReceipt,
-                    child: const Text('Cancel'),
+                  const SizedBox(height: 8),
+                  Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    decoration: BoxDecoration(
+                      gradient: const LinearGradient(
+                        colors: [Color(0xFF0D47A1), Color(0xFF1565C0)],
+                        begin: Alignment.centerLeft,
+                        end: Alignment.centerRight,
+                      ),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: const Row(
+                      children: [
+                        Expanded(
+                          flex: 3,
+                          child: Text('Name',
+                              style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.w700)),
+                        ),
+                        Expanded(
+                          flex: 2,
+                          child: Text('Mobile',
+                              style: TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.w600)),
+                        ),
+                        Expanded(
+                          flex: 2,
+                          child: Text('Date',
+                              style: TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.w600)),
+                        ),
+                        Expanded(
+                          flex: 2,
+                          child: Text('Amount',
+                              style: TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.w600)),
+                        ),
+                        SizedBox(width: 48),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Expanded(
+                    child: receipts.isEmpty
+                        ? Center(
+                            child: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Icon(Icons.receipt_long_outlined,
+                                    size: 40, color: Colors.grey[300]),
+                                const SizedBox(height: 10),
+                                Text('No receipts found',
+                                    style: TextStyle(
+                                        color: Colors.grey[400], fontSize: 13)),
+                              ],
+                            ),
+                          )
+                        : ClipRRect(
+                            borderRadius: BorderRadius.circular(8),
+                            child: ListView.separated(
+                              itemCount: receipts.length,
+                              separatorBuilder: (_, __) => Divider(
+                                  height: 1, color: Colors.blue.shade50),
+                              itemBuilder: (context, index) {
+                                final receipt = receipts[index];
+                                final sourceIndex =
+                                    DataService.receipts.indexOf(receipt);
+                                final isHov = _hoveredReceiptIndex == index;
+                                return MouseRegion(
+                                  cursor: SystemMouseCursors.click,
+                                  onEnter: (_) => setState(
+                                      () => _hoveredReceiptIndex = index),
+                                  onExit: (_) => setState(
+                                      () => _hoveredReceiptIndex = null),
+                                  child: InkWell(
+                                    onTap: sourceIndex >= 0
+                                        ? () => _loadReceiptFromHistory(receipt,
+                                            index: sourceIndex)
+                                        : null,
+                                    child: AnimatedContainer(
+                                      duration:
+                                          const Duration(milliseconds: 150),
+                                      padding: const EdgeInsets.symmetric(
+                                          horizontal: 10, vertical: 7),
+                                      color: isHov
+                                          ? const Color(0xFFE8F0FF)
+                                          : (index.isEven
+                                              ? Colors.white
+                                              : const Color(0xFFFAFBFF)),
+                                      child: Row(
+                                        children: [
+                                          Expanded(
+                                            flex: 3,
+                                            child: Column(
+                                              crossAxisAlignment:
+                                                  CrossAxisAlignment.start,
+                                              children: [
+                                                Text(
+                                                  (receipt['name'] ?? '')
+                                                          .toString()
+                                                          .isEmpty
+                                                      ? 'Unnamed'
+                                                      : receipt['name']
+                                                          .toString(),
+                                                  maxLines: 1,
+                                                  overflow:
+                                                      TextOverflow.ellipsis,
+                                                  style: const TextStyle(
+                                                      fontSize: 11,
+                                                      fontWeight:
+                                                          FontWeight.w600,
+                                                      color: Color(0xFF0D47A1)),
+                                                ),
+                                                Text(
+                                                  '#${receipt['receiptNo'] ?? ''}',
+                                                  style: TextStyle(
+                                                      fontSize: 9,
+                                                      color: Colors.grey[500]),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                          Expanded(
+                                            flex: 2,
+                                            child: Text(
+                                              (receipt['mobile'] ?? '-')
+                                                  .toString(),
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: TextStyle(
+                                                  fontSize: 10,
+                                                  color: Colors.grey[700]),
+                                            ),
+                                          ),
+                                          Expanded(
+                                            flex: 2,
+                                            child: Text(
+                                              (receipt['date'] ?? '-')
+                                                  .toString(),
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: TextStyle(
+                                                  fontSize: 10,
+                                                  color: Colors.grey[600]),
+                                            ),
+                                          ),
+                                          Expanded(
+                                            flex: 2,
+                                            child: Container(
+                                              padding:
+                                                  const EdgeInsets.symmetric(
+                                                      horizontal: 6,
+                                                      vertical: 2),
+                                              decoration: BoxDecoration(
+                                                color: const Color(0xFF00897B)
+                                                    .withValues(alpha: 0.12),
+                                                borderRadius:
+                                                    BorderRadius.circular(12),
+                                              ),
+                                              child: Text(
+                                                (receipt['amount'] ?? '-')
+                                                    .toString(),
+                                                textAlign: TextAlign.center,
+                                                maxLines: 1,
+                                                overflow: TextOverflow.ellipsis,
+                                                style: const TextStyle(
+                                                    fontSize: 9,
+                                                    fontWeight: FontWeight.w700,
+                                                    color: Color(0xFF00695C)),
+                                              ),
+                                            ),
+                                          ),
+                                          SizedBox(
+                                            width: 48,
+                                            child: Row(
+                                              mainAxisAlignment:
+                                                  MainAxisAlignment.end,
+                                              children: [
+                                                SizedBox(
+                                                  width: 22,
+                                                  height: 22,
+                                                  child: IconButton(
+                                                    padding: EdgeInsets.zero,
+                                                    icon: const Icon(
+                                                        Icons.edit_outlined,
+                                                        size: 13,
+                                                        color:
+                                                            Color(0xFF0D47A1)),
+                                                    onPressed: sourceIndex >= 0
+                                                        ? () =>
+                                                            _loadReceiptFromHistory(
+                                                                receipt,
+                                                                index:
+                                                                    sourceIndex)
+                                                        : null,
+                                                    tooltip: 'Edit',
+                                                  ),
+                                                ),
+                                                SizedBox(
+                                                  width: 22,
+                                                  height: 22,
+                                                  child: IconButton(
+                                                    padding: EdgeInsets.zero,
+                                                    icon: const Icon(
+                                                        Icons.delete_outline,
+                                                        size: 13,
+                                                        color: Colors.red),
+                                                    onPressed: sourceIndex >= 0
+                                                        ? () =>
+                                                            _deleteReceiptFromHistory(
+                                                                sourceIndex)
+                                                        : null,
+                                                    tooltip: 'Delete',
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                );
+                              },
+                            ),
+                          ),
                   ),
                 ],
               ),
             ),
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: _historySearchController,
-                  onChanged: (_) => setState(() {}),
-                  decoration: InputDecoration(
-                    hintText: 'Search by name/mobile/date',
-                    prefixIcon: const Icon(Icons.search),
-                    isDense: true,
-                    filled: true,
-                    fillColor: Colors.grey[100],
-                    contentPadding: EdgeInsets.symmetric(
-                      horizontal: 10,
-                      vertical: compact ? 10 : 12,
-                    ),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(8),
-                      borderSide: BorderSide.none,
-                    ),
-                  ),
-                ),
+            const SizedBox(width: 6),
+            Container(
+              width: 2,
+              decoration: BoxDecoration(
+                color: const Color(0xFF0D47A1).withValues(alpha: 0.4),
+                borderRadius: BorderRadius.circular(1),
               ),
-              SizedBox(width: compact ? 6 : 8),
-              _buildTypographyRibbon(compact: compact),
-            ],
-          ),
-          SizedBox(height: compact ? 8 : 10),
-          Expanded(
-            child: receipts.isEmpty
-                ? const Center(
-                    child: Text(
-                      'No receipts found',
-                      style: TextStyle(color: Colors.black54),
-                    ),
-                  )
-                : ListView.separated(
-                    itemCount: receipts.length,
-                    separatorBuilder: (_, __) =>
-                        SizedBox(height: compact ? 6 : 8),
-                    itemBuilder: (context, index) {
-                      final receipt = receipts[index];
-                      final sourceIndex = DataService.receipts.indexOf(receipt);
+            ),
+            const SizedBox(width: 6),
+            _buildTypographyRibbon(compact: true),
+          ],
+        ),
+      );
+    }
 
-                      return InkWell(
-                        onTap: sourceIndex >= 0
-                            ? () => _loadReceiptFromHistory(
-                                  receipt,
-                                  index: sourceIndex,
-                                )
-                            : null,
-                        borderRadius: BorderRadius.circular(10),
-                        child: Container(
-                          padding: EdgeInsets.all(compact ? 8 : 10),
-                          decoration: BoxDecoration(
-                            color: const Color(0xFFF5F8FF),
-                            borderRadius: BorderRadius.circular(10),
-                            border: Border.all(
-                              color: const Color(0xFF0D47A1)
-                                  .withValues(alpha: 0.2),
-                            ),
-                          ),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                (receipt['name'] ?? '').toString().isEmpty
-                                    ? 'Unnamed Receipt'
-                                    : (receipt['name'] ?? '').toString(),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                  fontSize: compact ? 13 : 14,
-                                  fontWeight: FontWeight.w700,
-                                  color: const Color(0xFF0D47A1),
+    // -- DESKTOP branch � premium admin dashboard style ---------------
+    return Container(
+      width: width,
+      decoration: const BoxDecoration(
+        color: Color(0xFFF7F9FF),
+      ),
+      child: Column(
+        children: [
+          // -- Top accent bar -----------------------------------------
+          Container(
+            height: 3,
+            decoration: const BoxDecoration(
+              gradient: LinearGradient(
+                colors: [Color(0xFF0D47A1), Color(0xFF42A5F5)],
+                begin: Alignment.centerLeft,
+                end: Alignment.centerRight,
+              ),
+            ),
+          ),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(14, 14, 10, 14),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  // -- Main panel ---------------------------------------
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        // -- Header -------------------------------------
+                        Row(
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.all(8),
+                              decoration: BoxDecoration(
+                                gradient: const LinearGradient(
+                                  colors: [
+                                    Color(0xFF0D47A1),
+                                    Color(0xFF1976D2)
+                                  ],
+                                  begin: Alignment.topLeft,
+                                  end: Alignment.bottomRight,
                                 ),
-                              ),
-                              SizedBox(height: compact ? 3 : 4),
-                              Text(
-                                'Mobile: ${(receipt['mobile'] ?? '-').toString()}',
-                                style: TextStyle(fontSize: compact ? 12 : 13),
-                              ),
-                              Text(
-                                'Amount: ${(receipt['amount'] ?? '-').toString()}',
-                                style: TextStyle(fontSize: compact ? 12 : 13),
-                              ),
-                              Text(
-                                'Date: ${(receipt['date'] ?? '-').toString()}',
-                                style: TextStyle(fontSize: compact ? 12 : 13),
-                              ),
-                              SizedBox(height: compact ? 4 : 6),
-                              Row(
-                                mainAxisAlignment: MainAxisAlignment.end,
-                                children: [
-                                  TextButton.icon(
-                                    onPressed: sourceIndex >= 0
-                                        ? () => _loadReceiptFromHistory(
-                                              receipt,
-                                              index: sourceIndex,
-                                            )
-                                        : null,
-                                    style: TextButton.styleFrom(
-                                      visualDensity: compact
-                                          ? const VisualDensity(
-                                              horizontal: -2,
-                                              vertical: -2,
-                                            )
-                                          : VisualDensity.standard,
-                                      padding: compact
-                                          ? const EdgeInsets.symmetric(
-                                              horizontal: 6,
-                                              vertical: 4,
-                                            )
-                                          : null,
-                                    ),
-                                    icon: const Icon(Icons.edit, size: 15),
-                                    label: const Text('Edit'),
-                                  ),
-                                  SizedBox(width: compact ? 2 : 4),
-                                  TextButton.icon(
-                                    onPressed: sourceIndex >= 0
-                                        ? () => _deleteReceiptFromHistory(
-                                              sourceIndex,
-                                            )
-                                        : null,
-                                    style: TextButton.styleFrom(
-                                      visualDensity: compact
-                                          ? const VisualDensity(
-                                              horizontal: -2,
-                                              vertical: -2,
-                                            )
-                                          : VisualDensity.standard,
-                                      padding: compact
-                                          ? const EdgeInsets.symmetric(
-                                              horizontal: 6,
-                                              vertical: 4,
-                                            )
-                                          : null,
-                                    ),
-                                    icon: const Icon(
-                                      Icons.delete_outline,
-                                      size: 15,
-                                      color: Colors.red,
-                                    ),
-                                    label: const Text(
-                                      'Delete',
-                                      style: TextStyle(color: Colors.red),
-                                    ),
+                                borderRadius: BorderRadius.circular(10),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: const Color(0xFF0D47A1)
+                                        .withValues(alpha: 0.25),
+                                    blurRadius: 8,
+                                    offset: const Offset(0, 3),
                                   ),
                                 ],
                               ),
+                              child: const Icon(Icons.receipt_long,
+                                  color: Colors.white, size: 17),
+                            ),
+                            const SizedBox(width: 10),
+                            const Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  'Receipt History',
+                                  style: TextStyle(
+                                    fontSize: 16,
+                                    fontWeight: FontWeight.w800,
+                                    color: Color(0xFF0D47A1),
+                                    letterSpacing: -0.4,
+                                  ),
+                                ),
+                                Text(
+                                  'All saved receipts',
+                                  style: TextStyle(
+                                    fontSize: 10,
+                                    color: Color(0xFF90A4AE),
+                                    fontWeight: FontWeight.w500,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const Spacer(),
+                            // Count badge
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 10, vertical: 4),
+                              decoration: BoxDecoration(
+                                gradient: const LinearGradient(
+                                  colors: [
+                                    Color(0xFF0D47A1),
+                                    Color(0xFF1565C0)
+                                  ],
+                                  begin: Alignment.topLeft,
+                                  end: Alignment.bottomRight,
+                                ),
+                                borderRadius: BorderRadius.circular(20),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: const Color(0xFF0D47A1)
+                                        .withValues(alpha: 0.3),
+                                    blurRadius: 6,
+                                    offset: const Offset(0, 2),
+                                  ),
+                                ],
+                              ),
+                              child: Text(
+                                '${receipts.length} records',
+                                style: const TextStyle(
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.w700,
+                                  color: Colors.white,
+                                  letterSpacing: 0.3,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+
+                        const SizedBox(height: 14),
+
+                        // -- Edit mode banner ----------------------------
+                        if (_editingReceiptIndex != null)
+                          Container(
+                            width: double.infinity,
+                            margin: const EdgeInsets.only(bottom: 12),
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 12, vertical: 9),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFFE3F2FD),
+                              borderRadius: BorderRadius.circular(10),
+                              border: Border.all(
+                                  color: const Color(0xFF1976D2)
+                                      .withValues(alpha: 0.35),
+                                  width: 1),
+                            ),
+                            child: Row(
+                              children: [
+                                const Icon(Icons.edit_note,
+                                    size: 16, color: Color(0xFF1565C0)),
+                                const SizedBox(width: 8),
+                                const Expanded(
+                                  child: Text(
+                                    'Editing receipt � changes apply on Save',
+                                    style: TextStyle(
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.w600,
+                                        color: Color(0xFF1565C0)),
+                                  ),
+                                ),
+                                TextButton(
+                                  onPressed: _startNewReceipt,
+                                  style: TextButton.styleFrom(
+                                    foregroundColor: const Color(0xFF1565C0),
+                                    padding: const EdgeInsets.symmetric(
+                                        horizontal: 10, vertical: 4),
+                                    textStyle: const TextStyle(
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.w700),
+                                  ),
+                                  child: const Text('Cancel'),
+                                ),
+                              ],
+                            ),
+                          ),
+
+                        // -- Search bar ----------------------------------
+                        Container(
+                          decoration: BoxDecoration(
+                            color: Colors.white,
+                            borderRadius: BorderRadius.circular(12),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black.withValues(alpha: 0.06),
+                                blurRadius: 8,
+                                offset: const Offset(0, 2),
+                              ),
                             ],
                           ),
+                          child: TextField(
+                            controller: _historySearchController,
+                            onChanged: (_) => setState(() {}),
+                            style: const TextStyle(fontSize: 13),
+                            decoration: InputDecoration(
+                              hintText: 'Search by name, mobile, amount�',
+                              hintStyle: TextStyle(
+                                  color: Colors.grey[400], fontSize: 12.5),
+                              prefixIcon: const Icon(Icons.search,
+                                  size: 19, color: Color(0xFF0D47A1)),
+                              suffixIcon:
+                                  _historySearchController.text.isNotEmpty
+                                      ? IconButton(
+                                          icon: Icon(Icons.close,
+                                              size: 16,
+                                              color: Colors.grey[400]),
+                                          onPressed: () => setState(() =>
+                                              _historySearchController.clear()),
+                                        )
+                                      : null,
+                              isDense: false,
+                              filled: true,
+                              fillColor: Colors.white,
+                              contentPadding: const EdgeInsets.symmetric(
+                                  horizontal: 14, vertical: 13),
+                              border: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(14),
+                                borderSide: BorderSide.none,
+                              ),
+                              enabledBorder: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(14),
+                                borderSide: BorderSide(
+                                    color: Colors.grey.shade200, width: 1),
+                              ),
+                              focusedBorder: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(14),
+                                borderSide: const BorderSide(
+                                    color: Color(0xFF0D47A1), width: 1.8),
+                              ),
+                            ),
+                          ),
                         ),
-                      );
-                    },
+
+                        const SizedBox(height: 12),
+
+                        // -- Table container -----------------------------
+                        Expanded(
+                          child: Container(
+                            decoration: BoxDecoration(
+                              color: Colors.white,
+                              borderRadius: BorderRadius.circular(14),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: Colors.black.withValues(alpha: 0.06),
+                                  blurRadius: 12,
+                                  offset: const Offset(0, 3),
+                                ),
+                              ],
+                            ),
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(14),
+                              child: Column(
+                                children: [
+                                  // -- Column header ---------------------
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(
+                                        horizontal: 16, vertical: 11),
+                                    decoration: const BoxDecoration(
+                                      gradient: LinearGradient(
+                                        colors: [
+                                          Color(0xFF0D47A1),
+                                          Color(0xFF1565C0),
+                                        ],
+                                        begin: Alignment.centerLeft,
+                                        end: Alignment.centerRight,
+                                      ),
+                                    ),
+                                    child: const Row(
+                                      children: [
+                                        Expanded(
+                                          flex: 34,
+                                          child: Text(
+                                            'Name & Ref',
+                                            style: TextStyle(
+                                              color: Colors.white,
+                                              fontSize: 11,
+                                              fontWeight: FontWeight.w700,
+                                              letterSpacing: 0.4,
+                                            ),
+                                          ),
+                                        ),
+                                        Expanded(
+                                          flex: 24,
+                                          child: Text(
+                                            'Mobile',
+                                            style: TextStyle(
+                                              color: Colors.white70,
+                                              fontSize: 11,
+                                              fontWeight: FontWeight.w600,
+                                              letterSpacing: 0.3,
+                                            ),
+                                          ),
+                                        ),
+                                        Expanded(
+                                          flex: 22,
+                                          child: Text(
+                                            'Date',
+                                            style: TextStyle(
+                                              color: Colors.white70,
+                                              fontSize: 11,
+                                              fontWeight: FontWeight.w600,
+                                              letterSpacing: 0.3,
+                                            ),
+                                          ),
+                                        ),
+                                        Expanded(
+                                          flex: 20,
+                                          child: Text(
+                                            'Amount',
+                                            style: TextStyle(
+                                              color: Colors.white70,
+                                              fontSize: 11,
+                                              fontWeight: FontWeight.w600,
+                                              letterSpacing: 0.3,
+                                            ),
+                                            textAlign: TextAlign.center,
+                                          ),
+                                        ),
+                                        SizedBox(width: 58),
+                                      ],
+                                    ),
+                                  ),
+
+                                  // -- Rows -----------------------------
+                                  Expanded(
+                                    child: receipts.isEmpty
+                                        ? Center(
+                                            child: Column(
+                                              mainAxisAlignment:
+                                                  MainAxisAlignment.center,
+                                              children: [
+                                                Container(
+                                                  padding:
+                                                      const EdgeInsets.all(18),
+                                                  decoration: BoxDecoration(
+                                                    color:
+                                                        const Color(0xFFF0F4FF),
+                                                    shape: BoxShape.circle,
+                                                  ),
+                                                  child: const Icon(
+                                                    Icons.receipt_long_outlined,
+                                                    size: 36,
+                                                    color: Color(0xFF90A4AE),
+                                                  ),
+                                                ),
+                                                const SizedBox(height: 14),
+                                                const Text(
+                                                  'No receipts found',
+                                                  style: TextStyle(
+                                                    fontSize: 14,
+                                                    fontWeight: FontWeight.w600,
+                                                    color: Color(0xFF90A4AE),
+                                                  ),
+                                                ),
+                                                const SizedBox(height: 4),
+                                                Text(
+                                                  'Try adjusting your search',
+                                                  style: TextStyle(
+                                                    fontSize: 11,
+                                                    color: Colors.grey[400],
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
+                                          )
+                                        : ListView.separated(
+                                            itemCount: receipts.length,
+                                            separatorBuilder: (_, __) =>
+                                                Divider(
+                                                    height: 1,
+                                                    color:
+                                                        Colors.grey.shade100),
+                                            itemBuilder: (context, index) {
+                                              final receipt = receipts[index];
+                                              final sourceIndex = DataService
+                                                  .receipts
+                                                  .indexOf(receipt);
+                                              final isHov =
+                                                  _hoveredReceiptIndex == index;
+                                              final isEditing =
+                                                  _editingReceiptIndex !=
+                                                          null &&
+                                                      sourceIndex ==
+                                                          _editingReceiptIndex;
+
+                                              final fullNo =
+                                                  (receipt['fullNo'] ?? '')
+                                                      .toString();
+                                              final contractNo =
+                                                  (receipt['contractNo'] ?? '')
+                                                      .toString();
+                                              final receiptNo =
+                                                  (receipt['receiptNo'] ?? '')
+                                                      .toString();
+                                              final displayRef = fullNo
+                                                      .isNotEmpty
+                                                  ? fullNo
+                                                  : (contractNo.isNotEmpty
+                                                      ? '$contractNo / $receiptNo'
+                                                      : (receiptNo.isNotEmpty
+                                                          ? '#$receiptNo'
+                                                          : '�'));
+
+                                              return MouseRegion(
+                                                cursor:
+                                                    SystemMouseCursors.click,
+                                                onEnter: (_) => setState(() =>
+                                                    _hoveredReceiptIndex =
+                                                        index),
+                                                onExit: (_) => setState(() =>
+                                                    _hoveredReceiptIndex =
+                                                        null),
+                                                child: InkWell(
+                                                  onTap: sourceIndex >= 0
+                                                      ? () =>
+                                                          _loadReceiptFromHistory(
+                                                            receipt,
+                                                            index: sourceIndex,
+                                                          )
+                                                      : null,
+                                                  child: AnimatedContainer(
+                                                    duration: const Duration(
+                                                        milliseconds: 150),
+                                                    padding: const EdgeInsets
+                                                        .symmetric(
+                                                        horizontal: 16,
+                                                        vertical: 12),
+                                                    decoration: BoxDecoration(
+                                                      color: isEditing
+                                                          ? const Color(
+                                                              0xFFE3F2FD)
+                                                          : (isHov
+                                                              ? const Color(
+                                                                  0xFFEEF4FF)
+                                                              : (index.isEven
+                                                                  ? Colors.white
+                                                                  : const Color(
+                                                                      0xFFFAFCFF))),
+                                                      border: isEditing
+                                                          ? Border(
+                                                              left: BorderSide(
+                                                                  color: const Color(
+                                                                      0xFF1976D2),
+                                                                  width: 3))
+                                                          : null,
+                                                    ),
+                                                    child: Row(
+                                                      children: [
+                                                        // Name + ref
+                                                        Expanded(
+                                                          flex: 34,
+                                                          child: Column(
+                                                            crossAxisAlignment:
+                                                                CrossAxisAlignment
+                                                                    .start,
+                                                            children: [
+                                                              Text(
+                                                                (receipt['name'] ??
+                                                                            '')
+                                                                        .toString()
+                                                                        .isEmpty
+                                                                    ? 'Unnamed'
+                                                                    : receipt[
+                                                                            'name']
+                                                                        .toString(),
+                                                                maxLines: 1,
+                                                                overflow:
+                                                                    TextOverflow
+                                                                        .ellipsis,
+                                                                style:
+                                                                    TextStyle(
+                                                                  fontSize: 14,
+                                                                  fontWeight:
+                                                                      FontWeight
+                                                                          .w800,
+                                                                  color: isEditing
+                                                                      ? const Color(
+                                                                          0xFF1565C0)
+                                                                      : const Color(
+                                                                          0xFF1A2340),
+                                                                ),
+                                                              ),
+                                                              const SizedBox(
+                                                                  height: 2),
+                                                              Container(
+                                                                padding: const EdgeInsets
+                                                                    .symmetric(
+                                                                    horizontal:
+                                                                        6,
+                                                                    vertical:
+                                                                        1),
+                                                                decoration:
+                                                                    BoxDecoration(
+                                                                  color: const Color(
+                                                                          0xFF0D47A1)
+                                                                      .withValues(
+                                                                          alpha:
+                                                                              0.08),
+                                                                  borderRadius:
+                                                                      BorderRadius
+                                                                          .circular(
+                                                                              5),
+                                                                ),
+                                                                child: Text(
+                                                                  displayRef,
+                                                                  style:
+                                                                      const TextStyle(
+                                                                    fontSize:
+                                                                        9.5,
+                                                                    fontWeight:
+                                                                        FontWeight
+                                                                            .w600,
+                                                                    color: Color(
+                                                                        0xFF0D47A1),
+                                                                  ),
+                                                                ),
+                                                              ),
+                                                            ],
+                                                          ),
+                                                        ),
+                                                        // Mobile
+                                                        Expanded(
+                                                          flex: 24,
+                                                          child: Text(
+                                                            (receipt['mobile'] ??
+                                                                    '�')
+                                                                .toString(),
+                                                            maxLines: 1,
+                                                            overflow:
+                                                                TextOverflow
+                                                                    .ellipsis,
+                                                            style: TextStyle(
+                                                              fontSize: 11.5,
+                                                              color: Colors
+                                                                  .grey[600],
+                                                              fontWeight:
+                                                                  FontWeight
+                                                                      .w500,
+                                                            ),
+                                                          ),
+                                                        ),
+                                                        // Date
+                                                        Expanded(
+                                                          flex: 22,
+                                                          child: Text(
+                                                            (receipt['date'] ??
+                                                                    '�')
+                                                                .toString(),
+                                                            maxLines: 1,
+                                                            overflow:
+                                                                TextOverflow
+                                                                    .ellipsis,
+                                                            style: TextStyle(
+                                                              fontSize: 11,
+                                                              color: Colors
+                                                                  .grey[500],
+                                                            ),
+                                                          ),
+                                                        ),
+                                                        // Amount badge
+                                                        Expanded(
+                                                          flex: 20,
+                                                          child: Center(
+                                                            child: Container(
+                                                              padding:
+                                                                  const EdgeInsets
+                                                                      .symmetric(
+                                                                      horizontal:
+                                                                          9,
+                                                                      vertical:
+                                                                          4),
+                                                              decoration:
+                                                                  BoxDecoration(
+                                                                color: const Color(
+                                                                        0xFF00897B)
+                                                                    .withValues(
+                                                                        alpha:
+                                                                            0.1),
+                                                                borderRadius:
+                                                                    BorderRadius
+                                                                        .circular(
+                                                                            20),
+                                                                border: Border.all(
+                                                                    color: const Color(
+                                                                            0xFF00897B)
+                                                                        .withValues(
+                                                                            alpha:
+                                                                                0.25),
+                                                                    width: 1),
+                                                              ),
+                                                              child: Text(
+                                                                (receipt['amount'] ??
+                                                                        '�')
+                                                                    .toString(),
+                                                                textAlign:
+                                                                    TextAlign
+                                                                        .center,
+                                                                maxLines: 1,
+                                                                overflow:
+                                                                    TextOverflow
+                                                                        .ellipsis,
+                                                                style:
+                                                                    const TextStyle(
+                                                                  fontSize: 11,
+                                                                  fontWeight:
+                                                                      FontWeight
+                                                                          .w700,
+                                                                  color: Color(
+                                                                      0xFF00695C),
+                                                                ),
+                                                              ),
+                                                            ),
+                                                          ),
+                                                        ),
+                                                        // Actions
+                                                        SizedBox(
+                                                          width: 58,
+                                                          child: Row(
+                                                            mainAxisAlignment:
+                                                                MainAxisAlignment
+                                                                    .end,
+                                                            children: [
+                                                              Tooltip(
+                                                                message: 'Edit',
+                                                                child: InkWell(
+                                                                  borderRadius:
+                                                                      BorderRadius
+                                                                          .circular(
+                                                                              7),
+                                                                  onTap: sourceIndex >=
+                                                                          0
+                                                                      ? () =>
+                                                                          _loadReceiptFromHistory(
+                                                                            receipt,
+                                                                            index:
+                                                                                sourceIndex,
+                                                                          )
+                                                                      : null,
+                                                                  child:
+                                                                      Container(
+                                                                    width: 26,
+                                                                    height: 26,
+                                                                    decoration:
+                                                                        BoxDecoration(
+                                                                      color: const Color(
+                                                                              0xFF0D47A1)
+                                                                          .withValues(
+                                                                              alpha: 0.08),
+                                                                      borderRadius:
+                                                                          BorderRadius.circular(
+                                                                              7),
+                                                                    ),
+                                                                    child:
+                                                                        const Icon(
+                                                                      Icons
+                                                                          .edit_outlined,
+                                                                      size: 14,
+                                                                      color: Color(
+                                                                          0xFF0D47A1),
+                                                                    ),
+                                                                  ),
+                                                                ),
+                                                              ),
+                                                              const SizedBox(
+                                                                  width: 6),
+                                                              Tooltip(
+                                                                message:
+                                                                    'Delete',
+                                                                child: InkWell(
+                                                                  borderRadius:
+                                                                      BorderRadius
+                                                                          .circular(
+                                                                              7),
+                                                                  onTap: sourceIndex >=
+                                                                          0
+                                                                      ? () => _deleteReceiptFromHistory(
+                                                                          sourceIndex)
+                                                                      : null,
+                                                                  child:
+                                                                      Container(
+                                                                    width: 26,
+                                                                    height: 26,
+                                                                    decoration:
+                                                                        BoxDecoration(
+                                                                      color: Colors
+                                                                          .red
+                                                                          .withValues(
+                                                                              alpha: 0.08),
+                                                                      borderRadius:
+                                                                          BorderRadius.circular(
+                                                                              7),
+                                                                    ),
+                                                                    child:
+                                                                        const Icon(
+                                                                      Icons
+                                                                          .delete_outline,
+                                                                      size: 14,
+                                                                      color: Colors
+                                                                          .red,
+                                                                    ),
+                                                                  ),
+                                                                ),
+                                                              ),
+                                                            ],
+                                                          ),
+                                                        ),
+                                                      ],
+                                                    ),
+                                                  ),
+                                                ),
+                                              );
+                                            },
+                                          ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
+
+                  // -- Typography ribbon (right side) -------------------
+                  const SizedBox(width: 8),
+                  Container(
+                    width: 2,
+                    margin: const EdgeInsets.symmetric(vertical: 6),
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        colors: [
+                          const Color(0xFF0D47A1).withValues(alpha: 0.0),
+                          const Color(0xFF0D47A1).withValues(alpha: 0.35),
+                          const Color(0xFF0D47A1).withValues(alpha: 0.0),
+                        ],
+                        begin: Alignment.topCenter,
+                        end: Alignment.bottomCenter,
+                      ),
+                      borderRadius: BorderRadius.circular(1),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  _buildTypographyRibbon(compact: false),
+                ],
+              ),
+            ),
           ),
         ],
       ),
@@ -1310,6 +2528,8 @@ class _ReceiptState extends State<Receipt> {
                 .toList(),
           ),
           const SizedBox(height: 4),
+          _buildBgColorButton(compact: compact),
+          const SizedBox(height: 4),
           _ribbonControlButton(
             icon: Icons.refresh,
             tooltip: 'Reset text style',
@@ -1321,6 +2541,7 @@ class _ReceiptState extends State<Receipt> {
                 _isInputItalic = false;
                 _isInputUnderline = false;
                 _inputFontStyle = 'Roboto';
+                _receiptBgColor = Colors.white;
               });
             },
           ),
@@ -1357,6 +2578,73 @@ class _ReceiptState extends State<Receipt> {
           ),
         ),
       ),
+    );
+  }
+
+  static const List<Color> _bgColorOptions = [
+    Colors.white,
+    Color(0xFFFFFDE7), // light yellow
+    Color(0xFFFFF9C4), // cream yellow
+    Color(0xFFFFF3E0), // light orange cream
+    Color(0xFFE8F5E9), // light green
+    Color(0xFFE3F2FD), // light blue
+  ];
+
+  Widget _buildBgColorButton({bool compact = false}) {
+    return PopupMenuButton<Color>(
+      tooltip: 'Receipt background color',
+      icon: Container(
+        width: 18,
+        height: 18,
+        decoration: BoxDecoration(
+          color: _receiptBgColor,
+          border: Border.all(
+            color: const Color(0xFF0D47A1).withValues(alpha: 0.6),
+            width: 1.5,
+          ),
+          borderRadius: BorderRadius.circular(4),
+        ),
+      ),
+      onSelected: (color) {
+        setState(() {
+          _receiptBgColor = color;
+        });
+      },
+      itemBuilder: (context) => _bgColorOptions.map((color) {
+        final labels = {
+          Colors.white: 'White',
+          const Color(0xFFFFFDE7): 'Light Yellow',
+          const Color(0xFFFFF9C4): 'Cream Yellow',
+          const Color(0xFFFFF3E0): 'Cream',
+          const Color(0xFFE8F5E9): 'Light Green',
+          const Color(0xFFE3F2FD): 'Light Blue',
+        };
+        return PopupMenuItem<Color>(
+          value: color,
+          child: Row(
+            children: [
+              Container(
+                width: 20,
+                height: 20,
+                decoration: BoxDecoration(
+                  color: color,
+                  border: Border.all(
+                    color: const Color(0xFF0D47A1).withValues(alpha: 0.4),
+                  ),
+                  borderRadius: BorderRadius.circular(4),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Text(labels[color] ?? ''),
+              if (_receiptBgColor == color)
+                const Padding(
+                  padding: EdgeInsets.only(left: 6),
+                  child: Icon(Icons.check, size: 14, color: Color(0xFF0D47A1)),
+                ),
+            ],
+          ),
+        );
+      }).toList(),
     );
   }
 
@@ -1416,512 +2704,901 @@ class _ReceiptState extends State<Receipt> {
   Widget build(BuildContext context) {
     final isMobile = MediaQuery.of(context).size.width < 900;
 
-    return Scaffold(
-      floatingActionButton: isMobile
-          ? FloatingActionButton.extended(
-              onPressed: _openHistorySheet,
-              icon: const Icon(Icons.history),
-              label: const Text('History'),
-            )
-          : null,
-      body: Row(
-        children: [
-          if (!isMobile) const Sidebar(currentIndex: 2),
-          if (!isMobile) _buildHistoryPanel(width: 320),
-          Expanded(
-            child: Container(
-              color: Colors.grey[300],
-              child: Center(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    // --- ZOOM FUNCTIONALITY --
-
-                    _buildZoomToolbar(),
-
-                    Expanded(
-                      child: LayoutBuilder(
-                        builder: (context, constraints) {
-                          final nextViewerSize = Size(
-                            constraints.maxWidth,
-                            constraints.maxHeight,
-                          );
-                          if ((nextViewerSize.width - _lastViewerSize.width)
-                                      .abs() >
-                                  0.5 ||
-                              (nextViewerSize.height - _lastViewerSize.height)
-                                      .abs() >
-                                  0.5) {
-                            _lastViewerSize = nextViewerSize;
-                            WidgetsBinding.instance.addPostFrameCallback((_) {
-                              if (mounted) {
-                                _setZoom(_zoomScale);
-                              }
-                            });
-                          }
-
-                          return Center(
-                            child: SizedBox(
-                              key: _viewerAreaKey,
-                              width: constraints.maxWidth,
-                              height: constraints.maxHeight,
-                              child: InteractiveViewer(
-                                transformationController: _zoomController,
-                                alignment: Alignment.center,
-                                minScale: _minZoom,
-                                maxScale: _maxZoom,
-                                panEnabled: true,
-                                scaleEnabled: true,
-                                trackpadScrollCausesScale: true,
-                                constrained: false,
-                                clipBehavior: Clip.none,
-                                boundaryMargin: const EdgeInsets.all(420),
-                                interactionEndFrictionCoefficient: 0.00006,
-                                onInteractionUpdate: (_) {
-                                  final currentScale =
-                                      _zoomController.value.getMaxScaleOnAxis();
-                                  if ((currentScale - _zoomScale).abs() >
-                                          0.01 &&
-                                      mounted) {
-                                    setState(() {
-                                      _zoomScale = currentScale.clamp(
-                                          _minZoom, _maxZoom);
-                                    });
-                                  }
-                                },
-                                child: RepaintBoundary(
-                                  key: _receiptBoundaryKey,
-                                  child: Container(
-                                    width: _receiptCardWidth,
-                                    height: _receiptCardHeight,
-                                    decoration: BoxDecoration(
-                                      color: Colors.white,
-                                      borderRadius: BorderRadius.circular(18),
-                                      border: Border.all(
-                                          color: const Color(0xFF0D47A1),
-                                          width: 3),
-                                      boxShadow: const [
-                                        BoxShadow(
-                                          color: Color(0x550D47A1),
-                                          blurRadius: 18,
-                                          spreadRadius: 3,
-                                          offset: Offset(0, 4),
-                                        ),
-                                        BoxShadow(
-                                          color: Colors.black12,
-                                          blurRadius: 6,
-                                          offset: Offset(0, 2),
-                                        ),
-                                      ],
-                                    ),
-                                    padding: const EdgeInsets.symmetric(
-                                        horizontal: 15, vertical: 10),
-                                    child: Column(
-                                      children: [
-                                        /// --- HEADER ---
-                                        Row(
-                                          mainAxisAlignment:
-                                              MainAxisAlignment.spaceBetween,
-                                          children: [
-                                            Expanded(
-                                              child: Column(
-                                                crossAxisAlignment:
-                                                    CrossAxisAlignment.start,
-                                                children: const [
-                                                  Text("Taj Royal Glass Co.",
-                                                      style: TextStyle(
-                                                          fontWeight:
-                                                              FontWeight.bold,
-                                                          fontSize: 16,
-                                                          color: Color(
-                                                              0xFF0D47A1))),
-                                                  Text(
-                                                      "for Glass & Mirrors Production",
-                                                      style: TextStyle(
-                                                          fontSize: 9,
-                                                          color:
-                                                              Color(0xFF0D47A1),
-                                                          fontWeight:
-                                                              FontWeight.bold)),
-                                                ],
-                                              ),
-                                            ),
-                                            Container(
-                                              width: 60,
-                                              height: 60,
-                                              color: Colors.white,
-                                              child: Image.asset(
-                                                "assets/logo.png",
-                                                fit: BoxFit.contain,
-                                              ),
-                                            ),
-                                            Expanded(
-                                              child: Column(
-                                                crossAxisAlignment:
-                                                    CrossAxisAlignment.end,
-                                                children: const [
-                                                  Text("شركة تـاج رويـال",
-                                                      style: TextStyle(
-                                                          fontWeight:
-                                                              FontWeight.bold,
-                                                          fontSize: 18,
-                                                          color: Color(
-                                                              0xFF0D47A1))),
-                                                  Text(
-                                                      "لتركيب الزجاج والمرايا والبراويز",
-                                                      style: TextStyle(
-                                                          fontSize: 9,
-                                                          color:
-                                                              Color(0xFF0D47A1),
-                                                          fontWeight:
-                                                              FontWeight.bold)),
-                                                ],
-                                              ),
-                                            ),
-                                          ],
-                                        ),
-
-                                        const SizedBox(height: 8),
-
-                                        /// --- TOP BOXES ---
-                                        Row(
-                                          crossAxisAlignment:
-                                              CrossAxisAlignment.start,
-                                          children: [
-                                            _buildTopBox("K.D | دينار",
-                                                controller: _kdController),
-                                            _buildTopBox("Fils | فلس",
-                                                controller: _filsController),
-                                            const Spacer(),
-                                            Column(
-                                              children: [
-                                                Container(
-                                                  width: 100,
-                                                  height: 20,
-                                                  decoration: const BoxDecoration(
-                                                      color: Color(0xFF0D47A1),
-                                                      borderRadius:
-                                                          BorderRadius.only(
-                                                              topLeft: Radius
-                                                                  .circular(4),
-                                                              topRight: Radius
-                                                                  .circular(
-                                                                      4))),
-                                                  child: const Center(
-                                                      child: Text(
-                                                          "Date / التاريخ",
-                                                          style: TextStyle(
-                                                              color:
-                                                                  Colors.white,
-                                                              fontSize: 9,
-                                                              fontWeight:
-                                                                  FontWeight
-                                                                      .bold))),
-                                                ),
-                                                Container(
-                                                  width: 100,
-                                                  height: 30,
-                                                  decoration: BoxDecoration(
-                                                      border: Border.all(
-                                                          color: const Color(
-                                                              0xFF0D47A1)),
-                                                      borderRadius:
-                                                          const BorderRadius
-                                                              .only(
-                                                              bottomLeft: Radius
-                                                                  .circular(4),
-                                                              bottomRight:
-                                                                  Radius
-                                                                      .circular(
-                                                                          4))),
-                                                  child: TextField(
-                                                    controller: _dateController,
-                                                    textAlign: TextAlign.center,
-                                                    style: const TextStyle(
-                                                        fontSize: 11,
-                                                        fontWeight:
-                                                            FontWeight.bold),
-                                                    decoration:
-                                                        const InputDecoration(
-                                                            isDense: true,
-                                                            border: InputBorder
-                                                                .none,
-                                                            contentPadding:
-                                                                EdgeInsets.only(
-                                                                    top: 6)),
-                                                  ),
-                                                ),
-                                              ],
-                                            ),
-                                            const SizedBox(width: 10),
-                                            _buildTopBox("No. / رقم",
-                                                width: 80,
-                                                controller: _noController),
-                                          ],
-                                        ),
-
-                                        /// --- CENTER VOUCHER TITLE ---
-                                        Container(
-                                          margin: const EdgeInsets.symmetric(
-                                              vertical: 8),
-                                          padding: const EdgeInsets.symmetric(
-                                              horizontal: 15, vertical: 3),
-                                          decoration: BoxDecoration(
-                                              border: Border.all(
-                                                  color:
-                                                      const Color(0xFF0D47A1),
-                                                  width: 1.5)),
-                                          child: Column(
-                                            children: const [
-                                              Text("سـند قـبـض",
-                                                  style: TextStyle(
-                                                      fontWeight:
-                                                          FontWeight.bold,
-                                                      fontSize: 12,
-                                                      color:
-                                                          Color(0xFF0D47A1))),
-                                              Text("Receipt Voucher",
-                                                  style: TextStyle(
-                                                      fontWeight:
-                                                          FontWeight.bold,
-                                                      fontSize: 10,
-                                                      color:
-                                                          Color(0xFF0D47A1))),
-                                            ],
-                                          ),
-                                        ),
-
-                                        /// --- FORM FIELDS ---
-
-                                        _buildLineField(
-                                            "Received from Mr./Messrs:",
-                                            "استلمنا من السيد / السادة:",
-                                            controller:
-                                                _receivedFromController),
-
-                                        _buildLineField(
-                                            "Mobile No:", "رقم الهاتف:",
-                                            controller: _mobileController),
-
-                                        _buildLineField("The sum of K.D.:",
-                                            "مبلغ وقدرة د.ك.:",
-                                            controller: _sumController),
-
-                                        Row(
-                                          children: [
-                                            Expanded(
-                                                child: _buildLineField(
-                                                    "On Bank:", "على بنك:",
-                                                    controller:
-                                                        _bankController)),
-                                            const SizedBox(width: 15),
-                                            Expanded(
-                                                child: _buildLineField(
-                                                    "Cash/Cheque No:",
-                                                    "نقداً/شيك رقم:",
-                                                    controller:
-                                                        _chequeController)),
-                                          ],
-                                        ),
-
-                                        _buildLineField(
-                                            "Being For:", "وذلك عن:",
-                                            controller: _beingForController),
-
-                                        const Spacer(),
-
-                                        /// --- SIGNATURE AREA ---
-
-                                        Row(
-                                          mainAxisAlignment:
-                                              MainAxisAlignment.spaceBetween,
-                                          children: [
-                                            _buildSignArea(
-                                                "Receiver's Name / اسم المستلم"),
-                                            _buildSignArea(
-                                                "Signature / التوقيع"),
-                                          ],
-                                        ),
-
-                                        /// --- FOOTER (EXACT IMAGE 2 MATCH) ---
-
-                                        const SizedBox(height: 20),
-
-                                        const Divider(
-                                            color: Color(0xFF0D47A1),
-                                            thickness: 2.0),
-
-                                        const SizedBox(height: 10),
-                                        Row(
-                                          mainAxisAlignment:
-                                              MainAxisAlignment.spaceBetween,
-                                          crossAxisAlignment:
-                                              CrossAxisAlignment.center,
-                                          children: [
-                                            Row(
-                                              children: [
-                                                const Icon(Icons.location_on,
-                                                    color: Color(0xFF0D47A1),
-                                                    size: 24),
-                                                const SizedBox(width: 9),
-                                                Column(
-                                                  crossAxisAlignment:
-                                                      CrossAxisAlignment.start,
-                                                  children: const [
-                                                    Text(
-                                                        "الراي - قطعة ١ - شارع ٢٦ - محل ١٣/١١",
-                                                        style: TextStyle(
-                                                            fontSize: 9.5,
-                                                            color: Color(
-                                                                0xFF0D47A1),
-                                                            fontWeight:
-                                                                FontWeight
-                                                                    .w800)),
-                                                    Text(
-                                                        "Al Rai Block 1 - St. 26 - Shop 11/13",
-                                                        style: TextStyle(
-                                                            fontSize: 9.5,
-                                                            color: Color(
-                                                                0xFF0D47A1),
-                                                            fontWeight:
-                                                                FontWeight
-                                                                    .w800)),
-                                                  ],
-                                                ),
-                                              ],
-                                            ),
-                                            Row(
-                                              children: const [
-                                                Icon(Icons.camera_alt_outlined,
-                                                    color: Color(0xFF0D47A1),
-                                                    size: 20),
-                                                SizedBox(width: 5),
-                                                Text("stainless_steelvip",
-                                                    style: TextStyle(
-                                                        fontSize: 11,
-                                                        color:
-                                                            Color(0xFF0D47A1),
-                                                        fontWeight:
-                                                            FontWeight.bold)),
-                                              ],
-                                            ),
-                                            Row(
-                                              children: [
-                                                const Icon(Icons.phone_android,
-                                                    color: Color(0xFF0D47A1),
-                                                    size: 20),
-                                                const SizedBox(width: 5),
-                                                Column(
-                                                  crossAxisAlignment:
-                                                      CrossAxisAlignment.start,
-                                                  children: const [
-                                                    Text("56540521",
-                                                        style: TextStyle(
-                                                            fontSize: 13,
-                                                            color: Color(
-                                                                0xFF0D47A1),
-                                                            fontWeight:
-                                                                FontWeight
-                                                                    .bold)),
-                                                    Text("96952550",
-                                                        style: TextStyle(
-                                                            fontSize: 13,
-                                                            color: Color(
-                                                                0xFF0D47A1),
-                                                            fontWeight:
-                                                                FontWeight
-                                                                    .bold)),
-                                                  ],
-                                                ),
-                                              ],
-                                            ),
-                                          ],
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-                                ),
-                              ),
-                            ),
-                          );
-                        },
-                      ),
-                    ),
-
-                    const SizedBox(height: 20),
-
-                    /// --- BUTTONS ---
-
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 20),
-                      child: Wrap(
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) {
+        if (!didPop) {
+          Navigator.pushReplacement(
+            context,
+            PageRouteBuilder(
+              transitionDuration: const Duration(milliseconds: 180),
+              pageBuilder: (_, __, ___) => const Dashboard(),
+              transitionsBuilder: (_, animation, __, child) =>
+                  FadeTransition(opacity: animation, child: child),
+            ),
+          );
+        }
+      },
+      child: Scaffold(
+        drawer: isMobile
+            ? const Drawer(
+                child: SafeArea(child: Sidebar(currentIndex: 2)),
+              )
+            : null,
+        floatingActionButton: isMobile
+            ? FloatingActionButton(
+                onPressed: _openHistorySheet,
+                backgroundColor: const Color(0xFF0D47A1),
+                mini: true,
+                tooltip: 'History',
+                child: const Icon(Icons.history, size: 20, color: Colors.white),
+              )
+            : null,
+        floatingActionButtonLocation: FloatingActionButtonLocation.startFloat,
+        bottomNavigationBar: isMobile
+            ? SafeArea(
+                top: false,
+                child: Container(
+                  color: Colors.white,
+                  padding: const EdgeInsets.fromLTRB(10, 8, 10, 10),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (_isProcessing)
+                        const Padding(
+                          padding: EdgeInsets.only(bottom: 6),
+                          child: SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          ),
+                        ),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
                         alignment: WrapAlignment.center,
-                        spacing: 15,
-                        runSpacing: 10,
                         children: [
-                          _buildActionButton("Print", Colors.blue,
-                              () => _runButtonAction('Print', _printReceipt)),
-                          _buildActionButton("Save PDF", Colors.green,
-                              () => _runButtonAction('Save PDF', _savePdf)),
-                          _buildActionButton(
-                              "Download PDF",
-                              Colors.blueAccent,
-                              () => _runButtonAction(
-                                  'Download PDF', _downloadPdf)),
-                          _buildActionButton("Share", Colors.orange,
-                              () => _runButtonAction('Share', _sharePdf)),
+                          _buildMobileActionButton(
+                            'New',
+                            Colors.indigo,
+                            _startNewReceipt,
+                          ),
+                          ElevatedButton.icon(
+                            icon: Icon(
+                              _showSignature
+                                  ? Icons.visibility
+                                  : Icons.visibility_off,
+                              color: Colors.white,
+                              size: 14,
+                            ),
+                            label: Text(
+                              _showSignature ? 'Sign ON' : 'Sign OFF',
+                              style: const TextStyle(
+                                  color: Colors.white, fontSize: 12),
+                            ),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: _showSignature
+                                  ? Colors.purple
+                                  : Colors.grey[700],
+                              foregroundColor: Colors.white,
+                              minimumSize: const Size(0, 38),
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 10, vertical: 10),
+                              shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(10)),
+                            ),
+                            onPressed: () => setState(
+                                () => _showSignature = !_showSignature),
+                          ),
+                          _buildMobileActionButton(
+                            'Print',
+                            Colors.blue,
+                            () => _runButtonAction('Print', _printReceipt),
+                          ),
+                          _buildMobileActionButton(
+                            'Save',
+                            Colors.green,
+                            () => _runButtonAction('Save PDF', _savePdf),
+                          ),
+                          _buildMobileActionButton(
+                            'Download',
+                            Colors.blueAccent,
+                            () =>
+                                _runButtonAction('Download PDF', _downloadPdf),
+                          ),
+                          _buildMobileActionButton(
+                            'Share',
+                            Colors.orange,
+                            () => _runButtonAction('Share', _sharePdf),
+                          ),
                         ],
                       ),
-                    ),
-                    if (_isProcessing)
-                      const Padding(
-                        padding: EdgeInsets.only(bottom: 12),
-                        child: Row(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            SizedBox(
-                              width: 18,
-                              height: 18,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            ),
-                            SizedBox(width: 10),
-                            Text(
-                              'Please wait... Processing PDF',
-                              style: TextStyle(
-                                fontSize: 12,
-                                fontWeight: FontWeight.w600,
-                                color: Color(0xFF0D47A1),
-                              ),
-                            ),
-                          ],
-                        ),
+                    ],
+                  ),
+                ),
+              )
+            : null,
+        body: Column(
+          children: [
+            if (isMobile)
+              Container(
+                height: 56,
+                padding: const EdgeInsets.symmetric(horizontal: 8),
+                decoration: const BoxDecoration(
+                  color: Colors.white,
+                  boxShadow: [BoxShadow(color: Colors.black12, blurRadius: 4)],
+                ),
+                child: Row(
+                  children: [
+                    Builder(
+                      builder: (context) => IconButton(
+                        icon: const Icon(Icons.menu),
+                        onPressed: () => Scaffold.of(context).openDrawer(),
                       ),
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 10),
-                      child: Text(
-                        _isWarmingUp
-                            ? 'PDF status: Updating full receipt...'
-                            : (_isPdfReadyForCurrentData()
-                                ? 'PDF status: Ready (full receipt)'
-                                : 'PDF status: Not ready yet'),
-                        style: const TextStyle(
-                          fontSize: 11,
-                          color: Color(0xFF0D47A1),
-                          fontWeight: FontWeight.w600,
-                        ),
+                    ),
+                    const SizedBox(width: 8),
+                    const Text(
+                      'Receipt',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 16,
                       ),
                     ),
                   ],
                 ),
               ),
+            Expanded(
+              child: Row(
+                children: [
+                  if (!isMobile) const Sidebar(currentIndex: 2),
+                  if (!isMobile) _buildHistoryPanel(width: 320),
+                  Expanded(
+                    child: Container(
+                      color: Colors.grey[300],
+                      child: Center(
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            // --- ZOOM FUNCTIONALITY --
+
+                            _buildZoomToolbar(),
+
+                            Expanded(
+                              child: LayoutBuilder(
+                                builder: (context, constraints) {
+                                  final nextViewerSize = Size(
+                                    constraints.maxWidth,
+                                    constraints.maxHeight,
+                                  );
+                                  final isFirstLayout =
+                                      _lastViewerSize == Size.zero;
+                                  if ((nextViewerSize.width -
+                                                  _lastViewerSize.width)
+                                              .abs() >
+                                          0.5 ||
+                                      (nextViewerSize.height -
+                                                  _lastViewerSize.height)
+                                              .abs() >
+                                          0.5) {
+                                    _lastViewerSize = nextViewerSize;
+                                    if (isFirstLayout && !_initialZoomSet) {
+                                      WidgetsBinding.instance
+                                          .addPostFrameCallback((_) {
+                                        if (mounted) {
+                                          _initialZoomSet = true;
+                                          final isMobileLayout =
+                                              nextViewerSize.width < 900;
+                                          final zoom = isMobileLayout
+                                              ? (nextViewerSize.width /
+                                                      _receiptCardWidth)
+                                                  .clamp(_minZoom, 1.0)
+                                              : 1.0;
+                                          _setZoom(
+                                            zoom,
+                                            viewerSize: nextViewerSize,
+                                          );
+                                        }
+                                      });
+                                    }
+                                  }
+
+                                  return Center(
+                                    child: SizedBox(
+                                      key: _viewerAreaKey,
+                                      width: constraints.maxWidth,
+                                      height: constraints.maxHeight,
+                                      child: InteractiveViewer(
+                                        transformationController:
+                                            _zoomController,
+                                        alignment: Alignment.center,
+                                        minScale: _minZoom,
+                                        maxScale: _maxZoom,
+                                        panEnabled: true,
+                                        scaleEnabled: true,
+                                        trackpadScrollCausesScale: true,
+                                        constrained: false,
+                                        clipBehavior: Clip.none,
+                                        boundaryMargin:
+                                            const EdgeInsets.all(420),
+                                        interactionEndFrictionCoefficient:
+                                            0.00006,
+                                        onInteractionUpdate: (_) {
+                                          final currentScale = _zoomController
+                                              .value
+                                              .getMaxScaleOnAxis();
+                                          if ((currentScale - _zoomScale)
+                                                      .abs() >
+                                                  0.01 &&
+                                              mounted) {
+                                            setState(() {
+                                              _zoomScale = currentScale.clamp(
+                                                  _minZoom, _maxZoom);
+                                            });
+                                          }
+                                        },
+                                        child: RepaintBoundary(
+                                          key: _receiptBoundaryKey,
+                                          child: Container(
+                                            width: _receiptCardWidth,
+                                            height: _receiptCardHeight,
+                                            decoration: BoxDecoration(
+                                              color: _receiptBgColor,
+                                              borderRadius:
+                                                  BorderRadius.circular(18),
+                                              border: Border.all(
+                                                  color:
+                                                      const Color(0xFF0D47A1),
+                                                  width: 3),
+                                              boxShadow: const [
+                                                BoxShadow(
+                                                  color: Color(0x550D47A1),
+                                                  blurRadius: 18,
+                                                  spreadRadius: 3,
+                                                  offset: Offset(0, 4),
+                                                ),
+                                                BoxShadow(
+                                                  color: Colors.black12,
+                                                  blurRadius: 6,
+                                                  offset: Offset(0, 2),
+                                                ),
+                                              ],
+                                            ),
+                                            padding: const EdgeInsets.symmetric(
+                                                horizontal: 15, vertical: 10),
+                                            child: Column(
+                                              children: [
+                                                /// --- HEADER ---
+                                                Row(
+                                                  mainAxisAlignment:
+                                                      MainAxisAlignment
+                                                          .spaceBetween,
+                                                  children: [
+                                                    Expanded(
+                                                      child: Column(
+                                                        crossAxisAlignment:
+                                                            CrossAxisAlignment
+                                                                .start,
+                                                        children: const [
+                                                          Text(
+                                                              "Taj Royal Glass Co.",
+                                                              style: TextStyle(
+                                                                  fontWeight:
+                                                                      FontWeight
+                                                                          .bold,
+                                                                  fontSize: 16,
+                                                                  color: Color(
+                                                                      0xFF0D47A1))),
+                                                          Text(
+                                                              "for Glass & Mirrors Production",
+                                                              style: TextStyle(
+                                                                  fontSize: 9,
+                                                                  color: Color(
+                                                                      0xFF0D47A1),
+                                                                  fontWeight:
+                                                                      FontWeight
+                                                                          .bold)),
+                                                        ],
+                                                      ),
+                                                    ),
+                                                    Container(
+                                                      width: 60,
+                                                      height: 60,
+                                                      color: Colors.white,
+                                                      child: Image.asset(
+                                                        "assets/logo.png",
+                                                        fit: BoxFit.contain,
+                                                      ),
+                                                    ),
+                                                    Expanded(
+                                                      child: Column(
+                                                        crossAxisAlignment:
+                                                            CrossAxisAlignment
+                                                                .end,
+                                                        children: const [
+                                                          Text(
+                                                              "شركة تـاج رويـال",
+                                                              style: TextStyle(
+                                                                  fontWeight:
+                                                                      FontWeight
+                                                                          .bold,
+                                                                  fontSize: 18,
+                                                                  color: Color(
+                                                                      0xFF0D47A1))),
+                                                          Text(
+                                                              "لتركيب الزجاج والمرايا والبراويز",
+                                                              style: TextStyle(
+                                                                  fontSize: 9,
+                                                                  color: Color(
+                                                                      0xFF0D47A1),
+                                                                  fontWeight:
+                                                                      FontWeight
+                                                                          .bold)),
+                                                        ],
+                                                      ),
+                                                    ),
+                                                  ],
+                                                ),
+
+                                                const SizedBox(height: 8),
+
+                                                /// --- TOP BOXES ---
+                                                Row(
+                                                  crossAxisAlignment:
+                                                      CrossAxisAlignment.start,
+                                                  children: [
+                                                    _buildTopBox("K.D | دينار",
+                                                        controller:
+                                                            _kdController),
+                                                    _buildTopBox("Fils | فلس",
+                                                        controller:
+                                                            _filsController),
+                                                    const Spacer(),
+                                                    Column(
+                                                      children: [
+                                                        Container(
+                                                          width: 100,
+                                                          height: 20,
+                                                          decoration: const BoxDecoration(
+                                                              color: Color(
+                                                                  0xFF0D47A1),
+                                                              borderRadius: BorderRadius.only(
+                                                                  topLeft: Radius
+                                                                      .circular(
+                                                                          4),
+                                                                  topRight: Radius
+                                                                      .circular(
+                                                                          4))),
+                                                          child: const Center(
+                                                              child: Text(
+                                                                  "Date / التاريخ",
+                                                                  style: TextStyle(
+                                                                      color: Colors
+                                                                          .white,
+                                                                      fontSize:
+                                                                          9,
+                                                                      fontWeight:
+                                                                          FontWeight
+                                                                              .bold))),
+                                                        ),
+                                                        Container(
+                                                          width: 100,
+                                                          height: 30,
+                                                          decoration: BoxDecoration(
+                                                              border: Border.all(
+                                                                  color: const Color(
+                                                                      0xFF0D47A1)),
+                                                              borderRadius: const BorderRadius
+                                                                  .only(
+                                                                  bottomLeft: Radius
+                                                                      .circular(
+                                                                          4),
+                                                                  bottomRight: Radius
+                                                                      .circular(
+                                                                          4))),
+                                                          child: TextField(
+                                                            controller:
+                                                                _dateController,
+                                                            textAlign: TextAlign
+                                                                .center,
+                                                            style: const TextStyle(
+                                                                fontSize: 11,
+                                                                fontWeight:
+                                                                    FontWeight
+                                                                        .bold),
+                                                            decoration: const InputDecoration(
+                                                                isDense: true,
+                                                                border:
+                                                                    InputBorder
+                                                                        .none,
+                                                                contentPadding:
+                                                                    EdgeInsets.only(
+                                                                        top:
+                                                                            6)),
+                                                          ),
+                                                        ),
+                                                      ],
+                                                    ),
+                                                    const SizedBox(width: 10),
+                                                    _buildNoBox(
+                                                        controller:
+                                                            _noController),
+                                                  ],
+                                                ),
+
+                                                /// --- CENTER VOUCHER TITLE ---
+                                                Container(
+                                                  margin: const EdgeInsets
+                                                      .symmetric(vertical: 8),
+                                                  padding: const EdgeInsets
+                                                      .symmetric(
+                                                      horizontal: 15,
+                                                      vertical: 3),
+                                                  decoration: BoxDecoration(
+                                                      border: Border.all(
+                                                          color: const Color(
+                                                              0xFF0D47A1),
+                                                          width: 1.5)),
+                                                  child: Column(
+                                                    children: const [
+                                                      Text("سـند قـبـض",
+                                                          style: TextStyle(
+                                                              fontWeight:
+                                                                  FontWeight
+                                                                      .bold,
+                                                              fontSize: 12,
+                                                              color: Color(
+                                                                  0xFF0D47A1))),
+                                                      Text("Receipt Voucher",
+                                                          style: TextStyle(
+                                                              fontWeight:
+                                                                  FontWeight
+                                                                      .bold,
+                                                              fontSize: 10,
+                                                              color: Color(
+                                                                  0xFF0D47A1))),
+                                                    ],
+                                                  ),
+                                                ),
+
+                                                /// --- FORM FIELDS ---
+
+                                                _buildLineField(
+                                                    "Received from Mr./Messrs:",
+                                                    "استلمنا من السيد / السادة:",
+                                                    controller:
+                                                        _receivedFromController),
+
+                                                _buildLineField(
+                                                    "Mobile No:", "رقم الهاتف:",
+                                                    controller:
+                                                        _mobileController),
+
+                                                _buildLineField(
+                                                    "The sum of K.D.:",
+                                                    "مبلغ وقدرة د.ك.:",
+                                                    controller: _sumController),
+
+                                                Row(
+                                                  children: [
+                                                    Expanded(
+                                                        child: _buildLineField(
+                                                            "On Bank:",
+                                                            "على بنك:",
+                                                            controller:
+                                                                _bankController)),
+                                                    const SizedBox(width: 15),
+                                                    Expanded(
+                                                        child: _buildLineField(
+                                                            "Cash/Cheque No:",
+                                                            "نقداً/شيك رقم:",
+                                                            controller:
+                                                                _chequeController)),
+                                                  ],
+                                                ),
+
+                                                _buildLineField(
+                                                    "Being For:", "وذلك عن:",
+                                                    controller:
+                                                        _beingForController),
+
+                                                const Spacer(),
+
+                                                /// --- SIGNATURE AREA ---
+
+                                                Row(
+                                                  mainAxisAlignment:
+                                                      MainAxisAlignment
+                                                          .spaceBetween,
+                                                  children: [
+                                                    _buildSignArea(
+                                                      "Receiver's Name / اسم المستلم",
+                                                      middleChild: SizedBox(
+                                                        width: 145,
+                                                        height: 25,
+                                                        child: TextField(
+                                                          controller:
+                                                              _receiverNameController,
+                                                          style:
+                                                              const TextStyle(
+                                                            fontSize: 9,
+                                                            color: Color(
+                                                                0xFF0D47A1),
+                                                            fontWeight:
+                                                                FontWeight.w600,
+                                                          ),
+                                                          textAlign:
+                                                              TextAlign.center,
+                                                          decoration:
+                                                              InputDecoration(
+                                                            isDense: true,
+                                                            border: InputBorder
+                                                                .none,
+                                                            hintText:
+                                                                'Enter name',
+                                                            hintStyle: TextStyle(
+                                                                fontSize: 8,
+                                                                color: Colors
+                                                                    .grey[400]),
+                                                            contentPadding:
+                                                                const EdgeInsets
+                                                                    .symmetric(
+                                                                    vertical:
+                                                                        4),
+                                                          ),
+                                                        ),
+                                                      ),
+                                                    ),
+                                                    _buildSignArea(
+                                                      "Signature / التوقيع",
+                                                      middleChild: SizedBox(
+                                                        height: 25,
+                                                        child: _showSignature
+                                                            ? Padding(
+                                                                padding:
+                                                                    const EdgeInsets
+                                                                        .only(
+                                                                  left: 10,
+                                                                  bottom: 5,
+                                                                ),
+                                                                child:
+                                                                    Image.asset(
+                                                                  'assets/sign.png',
+                                                                  fit: BoxFit
+                                                                      .contain,
+                                                                  alignment:
+                                                                      Alignment
+                                                                          .centerLeft,
+                                                                  errorBuilder: (_,
+                                                                          __,
+                                                                          ___) =>
+                                                                      const SizedBox
+                                                                          .shrink(),
+                                                                ),
+                                                              )
+                                                            : const SizedBox
+                                                                .shrink(),
+                                                      ),
+                                                    ),
+                                                  ],
+                                                ),
+
+                                                /// --- FOOTER (EXACT IMAGE 2 MATCH) ---
+
+                                                const SizedBox(height: 20),
+
+                                                const Divider(
+                                                    color: Color(0xFF0D47A1),
+                                                    thickness: 2.0),
+
+                                                const SizedBox(height: 10),
+                                                Row(
+                                                  mainAxisAlignment:
+                                                      MainAxisAlignment
+                                                          .spaceBetween,
+                                                  crossAxisAlignment:
+                                                      CrossAxisAlignment.center,
+                                                  children: [
+                                                    Row(
+                                                      children: [
+                                                        const Icon(
+                                                            Icons.location_on,
+                                                            color: Color(
+                                                                0xFF0D47A1),
+                                                            size: 24),
+                                                        const SizedBox(
+                                                            width: 9),
+                                                        Column(
+                                                          crossAxisAlignment:
+                                                              CrossAxisAlignment
+                                                                  .start,
+                                                          children: const [
+                                                            Text(
+                                                                "الراي - قطعة ١ - شارع ٢٦ - محل ١٣/١١",
+                                                                style: TextStyle(
+                                                                    fontSize:
+                                                                        9.5,
+                                                                    color: Color(
+                                                                        0xFF0D47A1),
+                                                                    fontWeight:
+                                                                        FontWeight
+                                                                            .w800)),
+                                                            Text(
+                                                                "Al Rai Block 1 - St. 26 - Shop 11/13",
+                                                                style: TextStyle(
+                                                                    fontSize:
+                                                                        9.5,
+                                                                    color: Color(
+                                                                        0xFF0D47A1),
+                                                                    fontWeight:
+                                                                        FontWeight
+                                                                            .w800)),
+                                                          ],
+                                                        ),
+                                                      ],
+                                                    ),
+                                                    Row(
+                                                      children: const [
+                                                        FaIcon(
+                                                            FontAwesomeIcons
+                                                                .instagram,
+                                                            color: Color(
+                                                                0xFF0D47A1),
+                                                            size: 20),
+                                                        SizedBox(width: 5),
+                                                        Text(
+                                                            "stainless_steelvip",
+                                                            style: TextStyle(
+                                                                fontSize: 11,
+                                                                color: Color(
+                                                                    0xFF0D47A1),
+                                                                fontWeight:
+                                                                    FontWeight
+                                                                        .bold)),
+                                                      ],
+                                                    ),
+                                                    Row(
+                                                      children: [
+                                                        const FaIcon(
+                                                            FontAwesomeIcons
+                                                                .whatsapp,
+                                                            color: Color(
+                                                                0xFF0D47A1),
+                                                            size: 20),
+                                                        const SizedBox(
+                                                            width: 5),
+                                                        Column(
+                                                          crossAxisAlignment:
+                                                              CrossAxisAlignment
+                                                                  .start,
+                                                          children: const [
+                                                            Text("56540521",
+                                                                style: TextStyle(
+                                                                    fontSize:
+                                                                        13,
+                                                                    color: Color(
+                                                                        0xFF0D47A1),
+                                                                    fontWeight:
+                                                                        FontWeight
+                                                                            .bold)),
+                                                            Text("96952550",
+                                                                style: TextStyle(
+                                                                    fontSize:
+                                                                        13,
+                                                                    color: Color(
+                                                                        0xFF0D47A1),
+                                                                    fontWeight:
+                                                                        FontWeight
+                                                                            .bold)),
+                                                          ],
+                                                        ),
+                                                      ],
+                                                    ),
+                                                  ],
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  );
+                                },
+                              ),
+                            ),
+
+                            if (!isMobile) ...[
+                              const SizedBox(height: 20),
+
+                              /// --- BUTTONS ---
+
+                              Padding(
+                                padding: const EdgeInsets.only(bottom: 20),
+                                child: Wrap(
+                                  alignment: WrapAlignment.center,
+                                  spacing: 15,
+                                  runSpacing: 10,
+                                  children: [
+                                    _buildActionButton(
+                                        "Print",
+                                        Colors.blue,
+                                        () => _runButtonAction(
+                                            'Print', _printReceipt)),
+                                    _buildActionButton(
+                                        "Save PDF",
+                                        Colors.green,
+                                        () => _runButtonAction(
+                                            'Save PDF', _savePdf)),
+                                    _buildActionButton(
+                                        "Download PDF",
+                                        Colors.blueAccent,
+                                        () => _runButtonAction(
+                                            'Download PDF', _downloadPdf)),
+                                    _buildActionButton(
+                                        "Share",
+                                        Colors.orange,
+                                        () => _runButtonAction(
+                                            'Share', _sharePdf)),
+                                    ElevatedButton.icon(
+                                      icon: Icon(
+                                        _showSignature
+                                            ? Icons.visibility
+                                            : Icons.visibility_off,
+                                        color: Colors.white,
+                                      ),
+                                      label: Text(
+                                        _showSignature
+                                            ? 'Signature ON'
+                                            : 'Signature OFF',
+                                        style: const TextStyle(
+                                          color: Colors.white,
+                                          fontWeight: FontWeight.w600,
+                                          fontSize: 13,
+                                        ),
+                                      ),
+                                      style: ElevatedButton.styleFrom(
+                                        backgroundColor: _showSignature
+                                            ? Colors.purple
+                                            : Colors.grey[700],
+                                        padding: const EdgeInsets.symmetric(
+                                            horizontal: 28, vertical: 16),
+                                        elevation: 2,
+                                        shape: RoundedRectangleBorder(
+                                            borderRadius:
+                                                BorderRadius.circular(12)),
+                                      ),
+                                      onPressed: () => setState(() =>
+                                          _showSignature = !_showSignature),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                            if (_isProcessing)
+                              const Padding(
+                                padding: EdgeInsets.only(bottom: 12),
+                                child: Row(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    SizedBox(
+                                      width: 18,
+                                      height: 18,
+                                      child: CircularProgressIndicator(
+                                          strokeWidth: 2),
+                                    ),
+                                    SizedBox(width: 10),
+                                    Text(
+                                      'Please wait... Processing PDF',
+                                      style: TextStyle(
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.w600,
+                                        color: Color(0xFF0D47A1),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            if (!isMobile)
+                              Padding(
+                                padding: const EdgeInsets.only(bottom: 10),
+                                child: Text(
+                                  _isWarmingUp
+                                      ? 'PDF status: Updating full receipt...'
+                                      : (_isPdfReadyForCurrentData()
+                                          ? 'PDF status: Ready (full receipt)'
+                                          : 'PDF status: Not ready yet'),
+                                  style: const TextStyle(
+                                    fontSize: 11,
+                                    color: Color(0xFF0D47A1),
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
 
   // Helper Methods (Boxes, Lines, Buttons)
+
+  Widget _buildNoBox({TextEditingController? controller}) {
+    final contractCtrl = controller ?? _noController;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        Container(
+          width: 100,
+          height: 20,
+          decoration: const BoxDecoration(
+            color: Color(0xFF0D47A1),
+            borderRadius: BorderRadius.only(
+              topLeft: Radius.circular(4),
+              topRight: Radius.circular(4),
+            ),
+          ),
+          child: const Center(
+            child: Text(
+              'No. / رقم',
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 8,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ),
+        ),
+        Container(
+          width: 100,
+          height: 30,
+          decoration: BoxDecoration(
+            border: Border.all(color: const Color(0xFF0D47A1)),
+            borderRadius: const BorderRadius.only(
+              bottomLeft: Radius.circular(4),
+              bottomRight: Radius.circular(4),
+            ),
+          ),
+          child: Center(
+            child: ValueListenableBuilder<TextEditingValue>(
+              valueListenable: _receiptNoController,
+              builder: (context, receiptVal, _) {
+                return ValueListenableBuilder<TextEditingValue>(
+                  valueListenable: contractCtrl,
+                  builder: (context, contractVal, _) {
+                    final contractPart = contractVal.text.isEmpty
+                        ? '----'
+                        : 'CT-${contractVal.text}';
+                    final receiptPart =
+                        receiptVal.text.isEmpty ? '1' : receiptVal.text;
+                    return FittedBox(
+                      fit: BoxFit.scaleDown,
+                      child: Text(
+                        '$contractPart / R$receiptPart',
+                        style: const TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.bold,
+                          color: Color(0xFF0D47A1),
+                          letterSpacing: 0.2,
+                        ),
+                        textAlign: TextAlign.center,
+                      ),
+                    );
+                  },
+                );
+              },
+            ),
+          ),
+        ),
+      ],
+    );
+  }
 
   Widget _buildTopBox(
     String label, {
@@ -2004,8 +3681,13 @@ class _ReceiptState extends State<Receipt> {
                 decoration: const InputDecoration(
                   isDense: true,
                   contentPadding: EdgeInsets.only(bottom: 2),
+                  border: InputBorder.none,
                   enabledBorder: UnderlineInputBorder(
                     borderSide: BorderSide(color: Color(0xFF0D47A1), width: 1),
+                  ),
+                  focusedBorder: UnderlineInputBorder(
+                    borderSide:
+                        BorderSide(color: Color(0xFF0D47A1), width: 1.5),
                   ),
                 ),
               ),
@@ -2024,7 +3706,7 @@ class _ReceiptState extends State<Receipt> {
     );
   }
 
-  Widget _buildSignArea(String label) {
+  Widget _buildSignArea(String label, {Widget? middleChild}) {
     return Column(
       children: [
         Text(
@@ -2035,7 +3717,7 @@ class _ReceiptState extends State<Receipt> {
             fontWeight: FontWeight.bold,
           ),
         ),
-        const SizedBox(height: 25),
+        middleChild ?? const SizedBox(height: 25),
         SizedBox(width: 150, child: _buildDottedSignatureLine()),
       ],
     );
@@ -2075,15 +3757,19 @@ class _ReceiptState extends State<Receipt> {
     return ElevatedButton(
       style: ElevatedButton.styleFrom(
         backgroundColor: color,
-        padding: const EdgeInsets.symmetric(horizontal: 25, vertical: 15),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+        padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 16),
+        elevation: 2,
+        shadowColor: color.withOpacity(0.4),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       ),
       onPressed: onTap,
       child: Text(
         label,
         style: const TextStyle(
           color: Colors.white,
-          fontWeight: FontWeight.bold,
+          fontWeight: FontWeight.w600,
+          fontSize: 13,
+          letterSpacing: 0.3,
         ),
       ),
     );

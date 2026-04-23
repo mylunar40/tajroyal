@@ -1,4 +1,4 @@
-import 'dart:async';
+﻿import 'dart:async';
 import 'dart:io';
 import 'dart:ui' as ui; // ← yeh zaroori hai
 import 'dart:typed_data';
@@ -13,10 +13,12 @@ import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:share_plus/share_plus.dart';
-import 'package:translator/translator.dart';
+import '../services/ai_translate.dart';
 import '../services/browser_file_download.dart';
 import '../widgets/sidebar.dart';
 import '../services/data_service.dart';
+import 'dashboard.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 
 class Contract extends StatefulWidget {
   const Contract({super.key, this.initialHistoryIndex});
@@ -36,6 +38,28 @@ class _SaveContractIntent extends Intent {
 }
 
 class _ContractState extends State<Contract> {
+  Future<String> getNextContractNo() async {
+    final ref = FirebaseFirestore.instance
+        .collection('counters')
+        .doc('contractCounter');
+
+    final doc = await ref.get();
+
+    int last = 0;
+
+    if (doc.exists) {
+      last = doc['lastNumber'] ?? 0;
+    }
+
+    last++;
+
+    await ref.set({
+      'lastNumber': last,
+    });
+
+    return 'CT-${last.toString().padLeft(4, '0')}';
+  }
+
   Future<void> _loadStampAndSignImages() async {
     try {
       final stampData = await rootBundle.load('assets/stamp.png');
@@ -44,7 +68,7 @@ class _ContractState extends State<Contract> {
       debugPrint('Failed to load stamp.png: $e');
       _stampImage = null;
     }
-
+    Color currentPaperColor = Colors.white;
     try {
       final signData = await rootBundle.load('assets/sign.png');
       _signImage = pw.MemoryImage(signData.buffer.asUint8List());
@@ -79,6 +103,9 @@ class _ContractState extends State<Contract> {
   // ON/OFF switch for showing sign/stamp
   bool showSignStamp = false;
 
+  // Paper background color — changes to transparent during PDF capture
+  Color currentPaperColor = Colors.white;
+
   TextEditingController content = TextEditingController();
   final TextEditingController _historySearchController =
       TextEditingController();
@@ -101,16 +128,18 @@ class _ContractState extends State<Contract> {
   final List<FocusNode> _paymentFocusNodesAr =
       List.generate(5, (_) => FocusNode());
 
-  final GoogleTranslator _translator = GoogleTranslator();
   final Map<TextEditingController, Timer> _translationDebouncers = {};
   final Map<TextEditingController, VoidCallback> _translationListeners = {};
   int? _editingContractIndex;
+  int? _hoveredContractIndex;
   final GlobalKey _contractBoundaryKey = GlobalKey();
+  final GlobalKey _hiddenContractKey = GlobalKey();
 
   Uint8List? _cachedPdfBytes;
   String _cachedPdfKey = '';
   bool _isProcessing = false;
   bool _isWarmingUp = false;
+  bool isDownloading = false;
   Timer? _warmupDebounce;
   static const Duration _warmupDebounceDelay = Duration(milliseconds: 1200);
   static const Duration _warmupRetryDelay = Duration(milliseconds: 700);
@@ -139,7 +168,9 @@ class _ContractState extends State<Contract> {
   ];
 
   late String _contractDateTime;
-  late String _contractNumber;
+  final TextEditingController _contractNumberController =
+      TextEditingController();
+  String get _contractNumber => 'CT-${_contractNumberController.text}';
   pw.Font arabicFont =
       pw.Font.helvetica(); // Safe default for fallback PDF path.
 
@@ -642,16 +673,16 @@ class _ContractState extends State<Contract> {
     }
 
     try {
-      final translated = await _translator.translate(raw, to: 'ar');
+      final result = await AITranslateService.toArabic(raw);
+
       if (!mounted) return;
 
-      final nextValue = translated.text.trim();
-      if (nextValue.isNotEmpty && target.text != nextValue) {
-        target.text = nextValue;
+      if (result.isNotEmpty && target.text != result) {
+        target.text = result;
         _onContractChanged();
       }
     } catch (_) {
-      // Keep previous Arabic value if translation fails temporarily.
+      // Keep previous Arabic value.
     }
   }
 
@@ -665,10 +696,8 @@ class _ContractState extends State<Contract> {
   }
 
   void _schedulePdfWarmup() {
-    if (kIsWeb) {
-      // Keep web editors smooth; build PDF only when user explicitly asks.
-      return;
-    }
+    // Warm up on both desktop and mobile; skip web to keep editing smooth.
+    if (kIsWeb) return;
 
     _warmupDebounce?.cancel();
     _warmupDebounce = Timer(_warmupDebounceDelay, () {
@@ -808,9 +837,10 @@ class _ContractState extends State<Contract> {
     return pdf.save();
   }
 
-  Future<Uint8List> _buildDirectPdfBytes() async {
+  Future<Uint8List> _buildDirectPdfBytes({Color? forceBgColor}) async {
     final pdf = pw.Document();
     final af = arabicFont;
+    final bgColor = PdfColor.fromInt((forceBgColor ?? currentPaperColor).value);
 
     String v(TextEditingController c) => c.text.trim();
 
@@ -822,7 +852,8 @@ class _ContractState extends State<Contract> {
             child: pw.Container(
               padding:
                   const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-              decoration: pw.BoxDecoration(border: pw.Border.all()),
+              decoration:
+                  pw.BoxDecoration(border: pw.Border.all(), color: bgColor),
               child: pw.Column(
                 crossAxisAlignment: pw.CrossAxisAlignment.start,
                 children: [
@@ -841,7 +872,8 @@ class _ContractState extends State<Contract> {
             child: pw.Container(
               padding:
                   const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-              decoration: pw.BoxDecoration(border: pw.Border.all()),
+              decoration:
+                  pw.BoxDecoration(border: pw.Border.all(), color: bgColor),
               child: pw.Column(
                 crossAxisAlignment: pw.CrossAxisAlignment.end,
                 children: [
@@ -872,7 +904,8 @@ class _ContractState extends State<Contract> {
             child: pw.Container(
               padding:
                   const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 6),
-              decoration: pw.BoxDecoration(border: pw.Border.all()),
+              decoration:
+                  pw.BoxDecoration(border: pw.Border.all(), color: bgColor),
               height: 120,
               child: pw.Column(
                 crossAxisAlignment: pw.CrossAxisAlignment.start,
@@ -893,7 +926,8 @@ class _ContractState extends State<Contract> {
             child: pw.Container(
               padding:
                   const pw.EdgeInsets.symmetric(horizontal: 6, vertical: 6),
-              decoration: pw.BoxDecoration(border: pw.Border.all()),
+              decoration:
+                  pw.BoxDecoration(border: pw.Border.all(), color: bgColor),
               constraints: const pw.BoxConstraints(minHeight: 100),
               child: pw.Column(
                 crossAxisAlignment: pw.CrossAxisAlignment.end,
@@ -963,6 +997,7 @@ class _ContractState extends State<Contract> {
           return pw.Container(
             width: PdfPageFormat.a4.width,
             height: PdfPageFormat.a4.height,
+            color: bgColor,
             child: pw.Padding(
               padding:
                   const pw.EdgeInsets.symmetric(horizontal: 30, vertical: 20),
@@ -1016,7 +1051,8 @@ class _ContractState extends State<Contract> {
                       pw.Container(
                         padding: const pw.EdgeInsets.symmetric(
                             horizontal: 6, vertical: 3),
-                        decoration: pw.BoxDecoration(border: pw.Border.all()),
+                        decoration: pw.BoxDecoration(
+                            border: pw.Border.all(), color: bgColor),
                         child: pw.Column(
                           crossAxisAlignment: pw.CrossAxisAlignment.start,
                           children: [
@@ -1033,7 +1069,8 @@ class _ContractState extends State<Contract> {
                       pw.Container(
                         padding: const pw.EdgeInsets.symmetric(
                             horizontal: 14, vertical: 4),
-                        decoration: pw.BoxDecoration(border: pw.Border.all()),
+                        decoration: pw.BoxDecoration(
+                            border: pw.Border.all(), color: bgColor),
                         child: pw.Column(
                           children: [
                             pw.Text('عقد إتفاق',
@@ -1052,7 +1089,8 @@ class _ContractState extends State<Contract> {
                       pw.Container(
                         padding: const pw.EdgeInsets.symmetric(
                             horizontal: 6, vertical: 3),
-                        decoration: pw.BoxDecoration(border: pw.Border.all()),
+                        decoration: pw.BoxDecoration(
+                            border: pw.Border.all(), color: bgColor),
                         child: pw.Column(
                           crossAxisAlignment: pw.CrossAxisAlignment.end,
                           children: [
@@ -1133,26 +1171,29 @@ class _ContractState extends State<Contract> {
                           ],
                         ),
                         for (final p in payments)
-                          pw.TableRow(children: [
-                            pw.Padding(
-                              padding: const pw.EdgeInsets.all(5),
-                              child: pw.Text(p.$1,
-                                  style: const pw.TextStyle(fontSize: 9)),
-                            ),
-                            pw.Padding(
-                              padding: const pw.EdgeInsets.all(5),
-                              child: pw.Text(p.$3,
-                                  style: pw.TextStyle(
-                                      fontSize: 9,
-                                      fontWeight: pw.FontWeight.bold)),
-                            ),
-                            pw.Padding(
-                              padding: const pw.EdgeInsets.all(5),
-                              child: pw.Text(p.$2,
-                                  style: pw.TextStyle(font: af, fontSize: 9),
-                                  textDirection: pw.TextDirection.rtl),
-                            ),
-                          ]),
+                          pw.TableRow(
+                              decoration: pw.BoxDecoration(color: bgColor),
+                              children: [
+                                pw.Padding(
+                                  padding: const pw.EdgeInsets.all(5),
+                                  child: pw.Text(p.$1,
+                                      style: const pw.TextStyle(fontSize: 9)),
+                                ),
+                                pw.Padding(
+                                  padding: const pw.EdgeInsets.all(5),
+                                  child: pw.Text(p.$3,
+                                      style: pw.TextStyle(
+                                          fontSize: 9,
+                                          fontWeight: pw.FontWeight.bold)),
+                                ),
+                                pw.Padding(
+                                  padding: const pw.EdgeInsets.all(5),
+                                  child: pw.Text(p.$2,
+                                      style:
+                                          pw.TextStyle(font: af, fontSize: 9),
+                                      textDirection: pw.TextDirection.rtl),
+                                ),
+                              ]),
                       ],
                     ),
                   ),
@@ -1322,52 +1363,101 @@ class _ContractState extends State<Contract> {
 
   Future<void> _printContract() async {
     try {
-      await Future.delayed(const Duration(milliseconds: 300));
-      await WidgetsBinding.instance.endOfFrame;
-
-      final boundary = _contractBoundaryKey.currentContext?.findRenderObject()
-          as RenderRepaintBoundary?;
-
-      if (boundary == null) {
-        throw Exception("UI not ready");
-      }
-
-      final image = await boundary.toImage(pixelRatio: 3.0);
-      final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
-
-      if (byteData == null) {
-        throw Exception("Image conversion failed");
-      }
-
-      final pngBytes = byteData.buffer.asUint8List();
-
-      final pdf = pw.Document();
-      final imagePdf = pw.MemoryImage(pngBytes);
-
-      pdf.addPage(
-        pw.Page(
-          pageFormat: PdfPageFormat.a4,
-          margin: pw.EdgeInsets.zero,
-          build: (_) => pw.Image(imagePdf, fit: pw.BoxFit.fill),
-        ),
-      );
-
-      await Printing.layoutPdf(onLayout: (_) async => pdf.save());
+      final bytes = await _getContractPdfBytes();
+      await Printing.layoutPdf(onLayout: (_) async => bytes);
     } catch (e) {
       debugPrint("PRINT ERROR: $e");
     }
   }
 
+  /// Returns cached PDF bytes if up-to-date, otherwise builds and caches them.
+  Future<Uint8List> _getOrBuildPdfBytes() async {
+    final currentKey = _currentPdfDataKey();
+    if (_cachedPdfBytes != null && _cachedPdfKey == currentKey) {
+      return _cachedPdfBytes!;
+    }
+    final bytes = await _buildDirectPdfBytes();
+    _cachedPdfBytes = bytes;
+    _cachedPdfKey = currentKey;
+    return bytes;
+  }
+
   Future<void> _saveContractOnly() async {
-    final contractName = _buildContractName();
-    final contractDate = _formatAutoDateTime(DateTime.now());
+    try {
+      // For NEW contracts: fetch the number BEFORE saving so Firestore doc
+      // is never stored with a blank contractNo.
+      if (_editingContractIndex == null) {
+        final nextNo = await getNextContractNo();
+        if (!mounted) return;
+        setState(() {
+          _contractNumberController.text = nextNo.replaceAll('CT-', '');
+        });
+      }
 
-    _saveContractHistory(
-      name: contractName,
-      date: contractDate,
-      body: content.text,
-    );
+      final contractNo =
+          _contractNumberController.text.trim().replaceAll('CT-', '');
 
+      final data = {
+        "contractNo": contractNo,
+        "date": _contractDateTime,
+        "name": _nameController.text.trim(),
+        "mobile": _mobileController.text.trim(),
+        "address": _addressController.text.trim(),
+        "description": _descriptionController.text.trim(),
+        "nameArabic": _nameArabicController.text.trim(),
+        "mobileArabic": _mobileArabicController.text.trim(),
+        "addressArabic": _addressArabicController.text.trim(),
+        "descriptionArabic": _descriptionArabicController.text.trim(),
+        "paymentsEn":
+            _paymentValueControllersEn.map((e) => e.text.trim()).toList(),
+        "paymentsAr":
+            _paymentValueControllersAr.map((e) => e.text.trim()).toList(),
+        "updatedAt": FieldValue.serverTimestamp(),
+      };
+
+      // Check if editing an existing history entry that has a Firestore doc
+      final editingIndex = _editingContractIndex;
+      final existingFirestoreId = (editingIndex != null &&
+              editingIndex >= 0 &&
+              editingIndex < DataService.contracts.length)
+          ? DataService.contracts[editingIndex]['firestoreId']?.toString()
+          : null;
+
+      if (existingFirestoreId != null && existingFirestoreId.isNotEmpty) {
+        // Update existing Firestore document — no duplicate created
+        await FirebaseFirestore.instance
+            .collection('contracts')
+            .doc(existingFirestoreId)
+            .set(data, SetOptions(merge: true));
+      } else {
+        // New contract — create new Firestore document
+        data['createdAt'] = FieldValue.serverTimestamp();
+        final docRef =
+            await FirebaseFirestore.instance.collection('contracts').add(data);
+        // Store the new firestoreId so subsequent saves also update correctly
+        if (editingIndex != null &&
+            editingIndex >= 0 &&
+            editingIndex < DataService.contracts.length) {
+          DataService.contracts[editingIndex]['firestoreId'] = docRef.id;
+        }
+      }
+
+      // Add contract to local history so it appears in search/dashboard
+      _saveContractHistory(
+        name: _nameController.text.trim(),
+        date: _contractDateTime,
+        body: content.text.trim(),
+      );
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Saved to Firebase")),
+      );
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("Save Failed: $e")),
+      );
+      return;
+    }
     if (mounted) {
       setState(() {
         _editingContractIndex = null;
@@ -1381,7 +1471,8 @@ class _ContractState extends State<Contract> {
   Future<void> _downloadPdf() async {
     try {
       debugPrint('DOWNLOADING DIRECT PDF');
-      final bytes = await _buildDirectPdfBytes();
+      // Use cache if available for instant response
+      final bytes = await _getOrBuildPdfBytes();
       final now = DateTime.now();
       final name =
           'contract_${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}.pdf';
@@ -1451,11 +1542,11 @@ class _ContractState extends State<Contract> {
       final bytes = await pdf.save();
 
       final now = DateTime.now();
-      final name =
+      final fileName =
           'contract_${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}.pdf';
 
       if (kIsWeb) {
-        await downloadPdfBytes(bytes, name);
+        await downloadPdfBytes(bytes, fileName);
         if (context.mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(content: Text('PDF download started')),
@@ -1467,7 +1558,7 @@ class _ContractState extends State<Contract> {
       final downloadDir = await getDownloadsDirectory();
       final fallbackDir = await getApplicationDocumentsDirectory();
       final targetDir = downloadDir ?? fallbackDir;
-      final file = File('${targetDir.path}/$name');
+      final file = File('${targetDir.path}/$fileName');
       await file.writeAsBytes(bytes);
 
       if (context.mounted) {
@@ -1484,11 +1575,111 @@ class _ContractState extends State<Contract> {
     }
   }
 
+  Future<void> _shareContractPdf() async {
+    try {
+      await Future.delayed(const Duration(milliseconds: 300));
+      await WidgetsBinding.instance.endOfFrame;
+
+      final now = DateTime.now();
+      final fileName =
+          'taj_royal_contract_${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}.pdf';
+
+      if (kIsWeb) {
+        final bytes = await _buildDirectPdfBytes(
+          forceBgColor: const Color(0xFFFFFDD0),
+        );
+        await Share.shareXFiles(
+          [XFile.fromData(bytes, mimeType: 'application/pdf', name: fileName)],
+          text: 'Taj Royal Glass Co. - Contract Paper',
+        );
+      } else {
+        // Mobile: hidden raw A4 widget se capture karo (InteractiveViewer/FittedBox se bahar)
+        // Taaki full A4 size mile, screen scaling affect na kare
+        await Future.delayed(const Duration(milliseconds: 300));
+        await WidgetsBinding.instance.endOfFrame;
+
+        Uint8List bytes;
+        final boundary = _hiddenContractKey.currentContext?.findRenderObject()
+            as RenderRepaintBoundary?;
+
+        if (boundary != null) {
+          final image = await boundary.toImage(pixelRatio: 3.0);
+          final byteData =
+              await image.toByteData(format: ui.ImageByteFormat.png);
+          final pngBytes = byteData!.buffer.asUint8List();
+          final pdf = pw.Document();
+          pdf.addPage(pw.Page(
+            pageFormat: PdfPageFormat.a4,
+            margin: pw.EdgeInsets.zero,
+            build: (_) =>
+                pw.Image(pw.MemoryImage(pngBytes), fit: pw.BoxFit.fill),
+          ));
+          bytes = await pdf.save();
+        } else {
+          // Fallback: programmatic PDF
+          bytes = await _buildDirectPdfBytes();
+        }
+
+        final dir = await getTemporaryDirectory();
+        final file = File('${dir.path}/$fileName');
+        await file.writeAsBytes(bytes);
+
+        await Share.shareXFiles(
+          [XFile(file.path)],
+          text: 'Taj Royal Glass Co. - Contract Paper',
+        );
+      }
+    } catch (e) {
+      debugPrint('Share failed: $e');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Share failed: $e')),
+        );
+      }
+    }
+  }
+
   Future<void> downloadContractFromServer() async {
+    setState(() {
+      isDownloading = true;
+    });
+
+    // Wait for the frame to fully paint with new colors
+    await Future.delayed(const Duration(milliseconds: 300));
+    await WidgetsBinding.instance.endOfFrame;
+
     await downloadContractPDF(
       context: context,
       repaintKey: _contractBoundaryKey,
     );
+
+    setState(() {
+      isDownloading = false;
+    });
+  }
+
+  Future<void> downloadWithColorFix() async {
+    setState(() {
+      isDownloading = true;
+    });
+
+    await Future.delayed(const Duration(milliseconds: 300));
+    await WidgetsBinding.instance.endOfFrame;
+
+    try {
+      await downloadContractPDF(
+        context: context,
+        repaintKey: _contractBoundaryKey,
+      );
+    } catch (e) {
+      debugPrint("Download error: $e");
+    }
+
+    if (mounted) {
+      setState(() {
+        isDownloading = false;
+      });
+    }
   }
 
   // ...existing code...
@@ -1518,6 +1709,11 @@ class _ContractState extends State<Contract> {
     return '$day/$month/$year $hour:$minute';
   }
 
+  String _nextContractNumber() {
+    final count = DataService.contracts.length + 1;
+    return count.toString().padLeft(4, '0');
+  }
+
   void _saveContractHistory({
     required String name,
     required String date,
@@ -1527,6 +1723,8 @@ class _ContractState extends State<Contract> {
       'name': name,
       'date': date,
       'content': body,
+      'contractNo': _contractNumberController.text.trim().replaceAll('CT-', ''),
+      'mobile': _mobileController.text.trim(),
       'payment_en': _paymentValueControllersEn
           .map((controller) => controller.text)
           .toList(),
@@ -1565,24 +1763,45 @@ class _ContractState extends State<Contract> {
       final name = (contract['name'] ?? '').toString().toLowerCase();
       final date = (contract['date'] ?? '').toString().toLowerCase();
       final body = (contract['content'] ?? '').toString().toLowerCase();
+      final contractNo =
+          (contract['contractNo'] ?? '').toString().toLowerCase();
+      final mobile = (contract['mobile'] ?? '').toString().toLowerCase();
       return name.contains(query) ||
           date.contains(query) ||
-          body.contains(query);
+          body.contains(query) ||
+          contractNo.contains(query) ||
+          mobile.contains(query);
     }).toList();
   }
 
   void _loadContractFromHistory(Map<String, dynamic> contract, {int? index}) {
-    final paymentEn = (contract['payment_en'] as List?)
-            ?.map((value) => value?.toString() ?? '')
-            .toList() ??
-        const <String>[];
-    final paymentAr = (contract['payment_ar'] as List?)
-            ?.map((value) => value?.toString() ?? '')
-            .toList() ??
-        const <String>[];
+    // 'payment_en' is used by local history; 'paymentsEn' is used by Firebase
+    final rawEn = contract['payment_en'] ?? contract['paymentsEn'];
+    final rawAr = contract['payment_ar'] ?? contract['paymentsAr'];
+    final paymentEn =
+        (rawEn as List?)?.map((value) => value?.toString() ?? '').toList() ??
+            const <String>[];
+    final paymentAr =
+        (rawAr as List?)?.map((value) => value?.toString() ?? '').toList() ??
+            const <String>[];
 
     setState(() {
       _editingContractIndex = index;
+      // Load all contract details
+      final contractNo = (contract['contractNo'] ?? '').toString();
+      _contractNumberController.text =
+          contractNo.replaceAll('CT-', ''); // Remove CT- prefix if present
+      _nameController.text = (contract['name'] ?? '').toString();
+      _mobileController.text = (contract['mobile'] ?? '').toString();
+      _addressController.text = (contract['address'] ?? '').toString();
+      _descriptionController.text = (contract['description'] ?? '').toString();
+      _nameArabicController.text = (contract['nameArabic'] ?? '').toString();
+      _mobileArabicController.text =
+          (contract['mobileArabic'] ?? '').toString();
+      _addressArabicController.text =
+          (contract['addressArabic'] ?? '').toString();
+      _descriptionArabicController.text =
+          (contract['descriptionArabic'] ?? '').toString();
       content.text = (contract['content'] ?? '').toString();
       for (var i = 0; i < _paymentValueControllersEn.length; i++) {
         _paymentValueControllersEn[i].text =
@@ -1596,8 +1815,18 @@ class _ContractState extends State<Contract> {
   }
 
   void _startNewContract() {
+    // Clear form for new contract without auto-incrementing number
     setState(() {
       _editingContractIndex = null;
+      _contractNumberController.clear();
+      _nameController.clear();
+      _mobileController.clear();
+      _addressController.clear();
+      _descriptionController.clear();
+      _nameArabicController.clear();
+      _mobileArabicController.clear();
+      _addressArabicController.clear();
+      _descriptionArabicController.clear();
       content.clear();
       _resetPaymentDetailsValues();
     });
@@ -1629,15 +1858,39 @@ class _ContractState extends State<Contract> {
       return;
     }
 
-    setState(() {
-      _deleteContractHistoryEntry(sourceIndex);
-      if (_editingContractIndex == sourceIndex) {
-        _editingContractIndex = null;
-      } else if (_editingContractIndex != null &&
-          _editingContractIndex! > sourceIndex) {
-        _editingContractIndex = _editingContractIndex! - 1;
+    try {
+      final contract = DataService.contracts[sourceIndex];
+      final firestoreId = contract['firestoreId']?.toString() ?? '';
+
+      if (firestoreId.isNotEmpty) {
+        await FirebaseFirestore.instance
+            .collection('contracts')
+            .doc(firestoreId)
+            .delete();
       }
-    });
+
+      setState(() {
+        _deleteContractHistoryEntry(sourceIndex);
+        if (_editingContractIndex == sourceIndex) {
+          _editingContractIndex = null;
+        } else if (_editingContractIndex != null &&
+            _editingContractIndex! > sourceIndex) {
+          _editingContractIndex = _editingContractIndex! - 1;
+        }
+      });
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Contract deleted successfully')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Delete failed: $e')),
+        );
+      }
+    }
   }
 
   Widget _buildHistoryPanel({double width = 300}) {
@@ -1647,167 +1900,325 @@ class _ContractState extends State<Contract> {
       width: width,
       color: Colors.white,
       padding: const EdgeInsets.all(12),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          const Text(
-            'Contract History',
-            style: TextStyle(
-              fontSize: 18,
-              fontWeight: FontWeight.bold,
-              color: Color(0xFF0D47A1),
-            ),
-          ),
-          const SizedBox(height: 10),
-          if (_editingContractIndex != null)
-            Container(
-              width: double.infinity,
-              margin: const EdgeInsets.only(bottom: 10),
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-              decoration: BoxDecoration(
-                color: const Color(0xFFE8F0FF),
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(
-                    color: const Color(0xFF0D47A1).withValues(alpha: 0.2)),
-              ),
-              child: Row(
-                children: [
-                  const Expanded(
-                    child: Text(
-                      'Edit mode is active',
-                      style: TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.w700,
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // ── Header ──────────────────────────────────────────
+                Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.all(6),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF0D47A1).withValues(alpha: 0.1),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: const Icon(
+                        Icons.description_outlined,
                         color: Color(0xFF0D47A1),
+                        size: 16,
                       ),
                     ),
-                  ),
-                  TextButton(
-                    onPressed: _startNewContract,
-                    child: const Text('Cancel'),
-                  ),
-                ],
-              ),
-            ),
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: _historySearchController,
-                  onChanged: (_) => setState(() {}),
-                  decoration: InputDecoration(
-                    hintText: 'Search by name or date/time',
-                    prefixIcon: const Icon(Icons.search),
-                    isDense: true,
-                    filled: true,
-                    fillColor: Colors.grey[100],
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(8),
-                      borderSide: BorderSide.none,
+                    const SizedBox(width: 8),
+                    const Text(
+                      'Contract History',
+                      style: TextStyle(
+                        fontSize: 17,
+                        fontWeight: FontWeight.w800,
+                        color: Color(0xFF0D47A1),
+                        letterSpacing: -0.3,
+                      ),
                     ),
-                  ),
+                    const Spacer(),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 8, vertical: 3),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF0D47A1).withValues(alpha: 0.09),
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      child: Text(
+                        '${contracts.length}',
+                        style: const TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700,
+                          color: Color(0xFF0D47A1),
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
-              ),
-              const SizedBox(width: 8),
-              _buildTypographyRibbon(),
-            ],
-          ),
-          const SizedBox(height: 10),
-          Expanded(
-            child: contracts.isEmpty
-                ? const Center(
-                    child: Text(
-                      'No contracts found',
-                      style: TextStyle(color: Colors.black54),
+                const SizedBox(height: 10),
+                // ── Edit mode banner ─────────────────────────────────
+                if (_editingContractIndex != null)
+                  Container(
+                    width: double.infinity,
+                    margin: const EdgeInsets.only(bottom: 10),
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFE8F0FF),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(
+                          color:
+                              const Color(0xFF0D47A1).withValues(alpha: 0.2)),
                     ),
-                  )
-                : ListView.separated(
-                    itemCount: contracts.length,
-                    separatorBuilder: (_, __) => const SizedBox(height: 8),
-                    itemBuilder: (context, index) {
-                      final contract = contracts[index];
-                      final sourceIndex =
-                          DataService.contracts.indexOf(contract);
-                      final preview = (contract['content'] ?? '').toString();
-
-                      return InkWell(
-                        onTap: sourceIndex >= 0
-                            ? () => _loadContractFromHistory(contract,
-                                index: sourceIndex)
-                            : null,
-                        borderRadius: BorderRadius.circular(10),
-                        child: Container(
-                          padding: const EdgeInsets.all(10),
-                          decoration: BoxDecoration(
-                            color: const Color(0xFFF5F8FF),
-                            borderRadius: BorderRadius.circular(10),
-                            border: Border.all(
-                              color: const Color(0xFF0D47A1)
-                                  .withValues(alpha: 0.2),
-                            ),
-                          ),
+                    child: Row(
+                      children: [
+                        Expanded(
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              Text(
-                                (contract['name'] ?? '').toString(),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
+                              const Text(
+                                'Edit mode is active',
+                                style: TextStyle(
+                                  fontSize: 12,
                                   fontWeight: FontWeight.w700,
                                   color: Color(0xFF0D47A1),
                                 ),
                               ),
                               const SizedBox(height: 4),
                               Text(
-                                  'Date: ${(contract['date'] ?? '-').toString()}'),
-                              const SizedBox(height: 3),
-                              Text(
-                                preview.isEmpty ? 'No content' : preview,
-                                maxLines: 2,
-                                overflow: TextOverflow.ellipsis,
+                                'Contract No: ${_contractNumberController.text}',
                                 style: const TextStyle(
-                                    fontSize: 12, color: Colors.black87),
-                              ),
-                              const SizedBox(height: 6),
-                              Row(
-                                mainAxisAlignment: MainAxisAlignment.end,
-                                children: [
-                                  TextButton.icon(
-                                    onPressed: sourceIndex >= 0
-                                        ? () => _loadContractFromHistory(
-                                            contract,
-                                            index: sourceIndex)
-                                        : null,
-                                    icon: const Icon(Icons.edit, size: 16),
-                                    label: const Text('Edit'),
-                                  ),
-                                  const SizedBox(width: 4),
-                                  TextButton.icon(
-                                    onPressed: sourceIndex >= 0
-                                        ? () => _deleteContractFromHistory(
-                                            sourceIndex)
-                                        : null,
-                                    icon: const Icon(
-                                      Icons.delete_outline,
-                                      size: 16,
-                                      color: Colors.red,
-                                    ),
-                                    label: const Text(
-                                      'Delete',
-                                      style: TextStyle(color: Colors.red),
-                                    ),
-                                  ),
-                                ],
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w600,
+                                  color: Color(0xFF0D47A1),
+                                ),
                               ),
                             ],
                           ),
                         ),
-                      );
-                    },
+                        TextButton(
+                          onPressed: _startNewContract,
+                          child: const Text('Cancel'),
+                        ),
+                      ],
+                    ),
                   ),
+                // ── Search bar ───────────────────────────────────────
+                TextField(
+                  controller: _historySearchController,
+                  onChanged: (_) => setState(() {}),
+                  decoration: InputDecoration(
+                    hintText: 'Search contracts…',
+                    hintStyle: TextStyle(color: Colors.grey[400], fontSize: 12),
+                    prefixIcon: const Icon(Icons.search,
+                        size: 18, color: Color(0xFF0D47A1)),
+                    isDense: true,
+                    filled: true,
+                    fillColor: const Color(0xFFF0F4FF),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(10),
+                      borderSide: BorderSide.none,
+                    ),
+                    focusedBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(10),
+                      borderSide: const BorderSide(
+                          color: Color(0xFF0D47A1), width: 1.5),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                // ── Table header ─────────────────────────────────────
+                Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                  decoration: BoxDecoration(
+                    gradient: const LinearGradient(
+                      colors: [Color(0xFF0D47A1), Color(0xFF1565C0)],
+                      begin: Alignment.centerLeft,
+                      end: Alignment.centerRight,
+                    ),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: const Row(
+                    children: [
+                      SizedBox(
+                        width: 70,
+                        child: Text(
+                          'No.',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 11,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                      Expanded(
+                        child: Padding(
+                          padding: EdgeInsets.symmetric(horizontal: 8),
+                          child: Text(
+                            'Name',
+                            style: TextStyle(
+                              color: Colors.white70,
+                              fontSize: 11,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                      ),
+                      SizedBox(width: 28),
+                      SizedBox(width: 28),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 2),
+                // ── Table rows ───────────────────────────────────────
+                Expanded(
+                  child: contracts.isEmpty
+                      ? const Center(
+                          child: Text(
+                            'No contracts found',
+                            style: TextStyle(color: Colors.black54),
+                          ),
+                        )
+                      : ScrollConfiguration(
+                          behavior: ScrollConfiguration.of(context)
+                              .copyWith(scrollbars: false),
+                          child: Scrollbar(
+                            thumbVisibility: true,
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(8),
+                              child: ListView.separated(
+                                physics: const AlwaysScrollableScrollPhysics(),
+                                itemCount: contracts.length,
+                                separatorBuilder: (_, __) => Divider(
+                                  height: 1,
+                                  color: Colors.blue.shade50,
+                                ),
+                                itemBuilder: (context, index) {
+                                  final contract = contracts[index];
+                                  final sourceIndex =
+                                      DataService.contracts.indexOf(contract);
+                                  final isHovered =
+                                      _hoveredContractIndex == index;
+
+                                  return Tooltip(
+                                    message:
+                                        'Ref: CT-${(contract['contractNo'] ?? '').toString().padLeft(4, '0')}\n'
+                                        'Name: ${(contract['name'] ?? '-').toString()}\n'
+                                        'Mobile: ${(contract['mobile'] ?? '-').toString()}\n'
+                                        'Date: ${(contract['date'] ?? '-').toString()}',
+                                    triggerMode: TooltipTriggerMode.tap,
+                                    showDuration: const Duration(seconds: 3),
+                                    child: MouseRegion(
+                                      cursor: SystemMouseCursors.click,
+                                      onEnter: (_) => setState(
+                                          () => _hoveredContractIndex = index),
+                                      onExit: (_) => setState(
+                                          () => _hoveredContractIndex = null),
+                                      child: InkWell(
+                                        onTap: sourceIndex >= 0
+                                            ? () => _loadContractFromHistory(
+                                                contract,
+                                                index: sourceIndex)
+                                            : null,
+                                        child: AnimatedContainer(
+                                          duration:
+                                              const Duration(milliseconds: 150),
+                                          padding: const EdgeInsets.symmetric(
+                                              horizontal: 12, vertical: 10),
+                                          color: isHovered
+                                              ? const Color(0xFFE8F0FF)
+                                              : (index.isEven
+                                                  ? Colors.white
+                                                  : const Color(0xFFFAFBFF)),
+                                          child: Row(
+                                            children: [
+                                              SizedBox(
+                                                width: 70,
+                                                child: Text(
+                                                  'CT-${(contract['contractNo'] ?? '').toString().padLeft(4, '0')}',
+                                                  style: const TextStyle(
+                                                    fontWeight: FontWeight.bold,
+                                                    color: Color(0xFF0D47A1),
+                                                    fontSize: 12,
+                                                  ),
+                                                ),
+                                              ),
+                                              Expanded(
+                                                child: Padding(
+                                                  padding: const EdgeInsets
+                                                      .symmetric(horizontal: 8),
+                                                  child: Text(
+                                                    (contract['name'] ?? '-')
+                                                        .toString(),
+                                                    maxLines: 1,
+                                                    overflow:
+                                                        TextOverflow.ellipsis,
+                                                    style: const TextStyle(
+                                                        fontSize: 12,
+                                                        color:
+                                                            Color(0xFF1A237E)),
+                                                  ),
+                                                ),
+                                              ),
+                                              SizedBox(
+                                                width: 24,
+                                                height: 24,
+                                                child: IconButton(
+                                                  padding: EdgeInsets.zero,
+                                                  icon: const Icon(
+                                                      Icons.edit_outlined,
+                                                      size: 14,
+                                                      color: Color(0xFF0D47A1)),
+                                                  onPressed: sourceIndex >= 0
+                                                      ? () =>
+                                                          _loadContractFromHistory(
+                                                              contract,
+                                                              index:
+                                                                  sourceIndex)
+                                                      : null,
+                                                  tooltip: 'Edit',
+                                                ),
+                                              ),
+                                              const SizedBox(width: 4),
+                                              SizedBox(
+                                                width: 24,
+                                                height: 24,
+                                                child: IconButton(
+                                                  padding: EdgeInsets.zero,
+                                                  icon: const Icon(
+                                                      Icons.delete_outline,
+                                                      size: 14,
+                                                      color: Colors.red),
+                                                  onPressed: sourceIndex >= 0
+                                                      ? () =>
+                                                          _deleteContractFromHistory(
+                                                              sourceIndex)
+                                                      : null,
+                                                  tooltip: 'Delete',
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  );
+                                },
+                              ),
+                            ),
+                          ),
+                        ),
+                ),
+              ],
+            ),
           ),
+          const SizedBox(width: 8),
+          Container(
+            width: 2,
+            decoration: BoxDecoration(
+              color: const Color(0xFF0D47A1).withValues(alpha: 0.4),
+              borderRadius: BorderRadius.circular(1),
+            ),
+          ),
+          const SizedBox(width: 8),
+          _buildTypographyRibbon(),
         ],
       ),
     );
@@ -1816,6 +2227,8 @@ class _ContractState extends State<Contract> {
   @override
   void initState() {
     super.initState();
+    // Load contracts from Firebase to ensure fresh data
+    DataService.loadContractsFromFirebase();
     rootBundle
         .load("assets/fonts/NotoNaskhArabic-Regular.ttf")
         .then((fontData) {
@@ -1860,7 +2273,7 @@ class _ContractState extends State<Contract> {
     _contractDateTime =
         '${now.day.toString().padLeft(2, '0')}/${now.month.toString().padLeft(2, '0')}/${now.year}  '
         '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}';
-    _contractNumber = 'CT-0001';
+    // Contract number will only be incremented after a successful save, not here.
     // Load Stamp and Sign images for PDF
     // ignore: unused_local_variable
     var loadStampAndSignImages = _loadStampAndSignImages();
@@ -1913,6 +2326,7 @@ class _ContractState extends State<Contract> {
     _translationListeners.clear();
     _translationDebouncers.clear();
     content.dispose();
+    _contractNumberController.dispose();
     _historySearchController.dispose();
     _nameController.dispose();
     _mobileController.dispose();
@@ -1938,6 +2352,65 @@ class _ContractState extends State<Contract> {
     super.dispose();
   }
 
+  Widget _buildContractNoBox() {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        RichText(
+          textAlign: TextAlign.center,
+          text: TextSpan(
+            style: const TextStyle(fontSize: 7, color: Colors.grey),
+            children: [
+              const TextSpan(text: 'Contract No. / '),
+              TextSpan(
+                text: 'رقم العقد',
+                style: _arabicTextStyle(
+                  fontSize: 7,
+                  fontWeight: FontWeight.w500,
+                  color: Colors.grey,
+                ),
+              ),
+            ],
+          ),
+        ),
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          mainAxisAlignment: MainAxisAlignment.center,
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            const Text(
+              'CT-',
+              style: TextStyle(
+                fontSize: 9,
+                fontWeight: FontWeight.bold,
+                color: Colors.black,
+                height: 1,
+              ),
+            ),
+            IntrinsicWidth(
+              child: TextField(
+                controller: _contractNumberController,
+                textAlign: TextAlign.left,
+                style: const TextStyle(
+                  fontSize: 9,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.black,
+                  height: 1,
+                ),
+                decoration: const InputDecoration(
+                  isDense: true,
+                  border: InputBorder.none,
+                  contentPadding: EdgeInsets.symmetric(vertical: 2),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
   Widget _buildSplitInfoBoxRow({
     required String englishLabel,
     required String arabicLabel,
@@ -1957,8 +2430,7 @@ class _ContractState extends State<Contract> {
     const BorderSide borderSide = BorderSide(color: Colors.black, width: 1.2);
     final bool isMultiline = rowHeight > 60;
     final BorderRadius boxRadius = BorderRadius.circular(8);
-    final Color boxColor =
-        premiumStyle ? const Color(0xFFF8FBFF) : Colors.white;
+    final Color boxColor = currentPaperColor;
     return Align(
       alignment: Alignment.topCenter,
       child: SizedBox(
@@ -1994,6 +2466,14 @@ class _ContractState extends State<Contract> {
                             child: TextField(
                               controller: controller,
                               onTap: () => _setActiveField(controller),
+                              onSubmitted: mirrorController != null
+                                  ? (value) async {
+                                      final result =
+                                          await AITranslateService.toArabic(
+                                              value);
+                                      mirrorController.text = result;
+                                    }
+                                  : null,
                               keyboardType: TextInputType.multiline,
                               textInputAction: TextInputAction.newline,
                               enabled: true,
@@ -2007,9 +2487,11 @@ class _ContractState extends State<Contract> {
                                 fallbackSize: valueFontSize,
                                 fallbackWeight: valueFontWeight,
                               ),
-                              decoration: const InputDecoration(
+                              decoration: InputDecoration(
                                 isDense: true,
                                 border: InputBorder.none,
+                                filled: true,
+                                fillColor: Colors.transparent,
                                 contentPadding: EdgeInsets.zero,
                               ),
                             ),
@@ -2032,6 +2514,14 @@ class _ContractState extends State<Contract> {
                             child: TextField(
                               controller: controller,
                               onTap: () => _setActiveField(controller),
+                              onSubmitted: mirrorController != null
+                                  ? (value) async {
+                                      final result =
+                                          await AITranslateService.toArabic(
+                                              value);
+                                      mirrorController.text = result;
+                                    }
+                                  : null,
                               keyboardType: isMultiline
                                   ? TextInputType.multiline
                                   : keyboardType,
@@ -2051,9 +2541,11 @@ class _ContractState extends State<Contract> {
                                 fallbackSize: valueFontSize,
                                 fallbackWeight: valueFontWeight,
                               ),
-                              decoration: const InputDecoration(
+                              decoration: InputDecoration(
                                 isDense: true,
                                 border: InputBorder.none,
+                                filled: true,
+                                fillColor: Colors.transparent,
                                 contentPadding: EdgeInsets.symmetric(
                                   horizontal: 8,
                                   vertical: 6,
@@ -2116,9 +2608,11 @@ class _ContractState extends State<Contract> {
                                 fallbackSize: valueFontSize,
                                 fallbackWeight: valueFontWeight,
                               ),
-                              decoration: const InputDecoration(
+                              decoration: InputDecoration(
                                 isDense: true,
                                 border: InputBorder.none,
+                                filled: true,
+                                fillColor: Colors.transparent,
                                 contentPadding: EdgeInsets.symmetric(
                                   horizontal: 8,
                                   vertical: 6,
@@ -2159,9 +2653,11 @@ class _ContractState extends State<Contract> {
                                 fallbackSize: valueFontSize,
                                 fallbackWeight: valueFontWeight,
                               ),
-                              decoration: const InputDecoration(
+                              decoration: InputDecoration(
                                 isDense: true,
                                 border: InputBorder.none,
+                                filled: true,
+                                fillColor: Colors.transparent,
                                 contentPadding: EdgeInsets.symmetric(
                                   horizontal: 8,
                                   vertical: 6,
@@ -2198,8 +2694,7 @@ class _ContractState extends State<Contract> {
     const double centerGap = 6;
     const BorderSide borderSide = BorderSide(color: Colors.black, width: 1.2);
     final BorderRadius boxRadius = BorderRadius.circular(8);
-    final Color boxColor =
-        premiumStyle ? const Color(0xFFF8FBFF) : Colors.white;
+    final Color boxColor = currentPaperColor;
 
     Widget buildSide({
       required List<String> labels,
@@ -2292,11 +2787,11 @@ class _ContractState extends State<Contract> {
                           fallbackSize: valueFontSize,
                           fallbackWeight: valueFontWeight,
                         ),
-                        decoration: const InputDecoration(
+                        decoration: InputDecoration(
                           hintText: 'Enter amount',
                           suffixText: 'KD',
                           filled: true,
-                          fillColor: Colors.white,
+                          fillColor: currentPaperColor,
                           isDense: true,
                           contentPadding: EdgeInsets.symmetric(
                             horizontal: 8,
@@ -2386,6 +2881,440 @@ class _ContractState extends State<Contract> {
     );
   }
 
+  Widget buildContractPaper({Key? captureKey}) {
+    return RepaintBoundary(
+      key: captureKey ?? _contractBoundaryKey,
+      child: Container(
+        width: _a4PageWidth,
+        height: _a4PageHeight,
+        decoration: BoxDecoration(
+          color: currentPaperColor,
+          borderRadius: BorderRadius.circular(8),
+          boxShadow: const [
+            BoxShadow(
+              color: Colors.black12,
+              blurRadius: 10,
+              offset: Offset(0, 5),
+            )
+          ],
+        ),
+        padding: const EdgeInsets.symmetric(horizontal: 30, vertical: 20),
+        child: Column(
+          children: [
+            /// --- HEADER (Same as Photo) ---
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // Left: English
+                const Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text("Taj Royal Glass Co.",
+                          style: TextStyle(
+                              fontWeight: FontWeight.bold, fontSize: 18)),
+                      Text("Mirror and Glass Manufacturing Factory",
+                          style: TextStyle(fontSize: 10)),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 12),
+                // Center: Logo Circle
+                Container(
+                  width: 60,
+                  height: 60,
+                  decoration: BoxDecoration(
+                    color: currentPaperColor,
+                    shape: BoxShape.circle,
+                  ),
+                  child: ClipOval(
+                    child: Image.asset(
+                      "assets/logo.png",
+                      fit: BoxFit.cover,
+                    ),
+                  ),
+                ),
+
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: [
+                      Text("شركة تـاج رويـال الزجاج",
+                          textDirection: TextDirection.rtl,
+                          textAlign: TextAlign.right,
+                          style: _arabicTextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
+                          )),
+                      Text("لتركيب الزجاج والمرايا والبراويز",
+                          textDirection: TextDirection.rtl,
+                          textAlign: TextAlign.right,
+                          style: _arabicTextStyle(
+                            fontSize: 10,
+                            fontWeight: FontWeight.w500,
+                          )),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+
+            const SizedBox(height: 22.7),
+
+            const Divider(
+              height: 1,
+              thickness: 1,
+              color: Colors.black,
+            ),
+
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: Align(
+                    alignment: Alignment.topLeft,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 6, vertical: 3),
+                      decoration: BoxDecoration(
+                        border: Border.all(width: 1, color: Colors.black),
+                        borderRadius: const BorderRadius.only(
+                          bottomRight: Radius.circular(4),
+                        ),
+                      ),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          RichText(
+                            text: TextSpan(
+                              style: const TextStyle(
+                                fontSize: 7,
+                                color: Colors.grey,
+                              ),
+                              children: [
+                                const TextSpan(text: 'Date / '),
+                                TextSpan(
+                                  text: 'التاريخ',
+                                  style: _arabicTextStyle(
+                                    fontSize: 7,
+                                    fontWeight: FontWeight.w500,
+                                    color: Colors.grey,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          Text(
+                            _contractDateTime,
+                            style: const TextStyle(
+                                fontSize: 9, fontWeight: FontWeight.bold),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+                Transform.translate(
+                  offset: const Offset(0, -1),
+                  child: Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                    decoration: const BoxDecoration(
+                      border: Border(
+                        left: BorderSide(width: 1),
+                        right: BorderSide(width: 1),
+                        bottom: BorderSide(width: 1),
+                      ),
+                      borderRadius: BorderRadius.only(
+                        bottomLeft: Radius.circular(5),
+                        bottomRight: Radius.circular(5),
+                      ),
+                    ),
+                    child: Column(
+                      children: [
+                        Text("عقد إتفاق",
+                            style: _arabicTextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.bold,
+                            )),
+                        const Text("Contract Paper",
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 10,
+                            )),
+                      ],
+                    ),
+                  ),
+                ),
+                Expanded(
+                  child: Align(
+                    alignment: Alignment.topRight,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 6, vertical: 3),
+                      decoration: BoxDecoration(
+                        border: Border.all(width: 1, color: Colors.black),
+                        borderRadius: const BorderRadius.only(
+                          bottomLeft: Radius.circular(4),
+                        ),
+                      ),
+                      child: _buildContractNoBox(),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+
+            const SizedBox(height: 8.5),
+
+            Column(
+              children: [
+                _buildSplitInfoBoxRow(
+                  englishLabel: 'Name',
+                  arabicLabel: 'الاسم',
+                  controller: _nameController,
+                  mirrorController: _nameArabicController,
+                  premiumStyle: true,
+                  labelFontSize: 8,
+                  valueFontSize: 10,
+                  valueFontWeight: FontWeight.w700,
+                ),
+                const SizedBox(height: 6),
+                _buildSplitInfoBoxRow(
+                  englishLabel: 'Mobile',
+                  arabicLabel: 'الهاتف',
+                  controller: _mobileController,
+                  mirrorController: _mobileArabicController,
+                  keyboardType: TextInputType.phone,
+                  premiumStyle: true,
+                  labelFontSize: 8,
+                  valueFontSize: 10,
+                  valueFontWeight: FontWeight.w700,
+                ),
+                const SizedBox(height: 6),
+                _buildSplitInfoBoxRow(
+                  englishLabel: 'Address',
+                  arabicLabel: 'العنوان',
+                  controller: _addressController,
+                  mirrorController: _addressArabicController,
+                  premiumStyle: true,
+                  labelFontSize: 8,
+                  valueFontSize: 10,
+                  valueFontWeight: FontWeight.w700,
+                ),
+                const SizedBox(height: 6),
+                _buildSplitInfoBoxRow(
+                  englishLabel: 'Description',
+                  arabicLabel: 'الوصف',
+                  controller: _descriptionController,
+                  mirrorController: _descriptionArabicController,
+                  rowHeight: 248,
+                  centerTallLabel: true,
+                  labelFontSize: 9,
+                  valueFontSize: 12,
+                  valueFontWeight: FontWeight.w700,
+                ),
+                const SizedBox(height: 18),
+                _buildPaymentDetailsSplitBox(
+                  rowHeight: 136,
+                  premiumStyle: true,
+                  titleFontSize: 8.5,
+                  valueFontSize: 12.5,
+                  valueFontWeight: FontWeight.w700,
+                ),
+              ],
+            ),
+
+            const Expanded(
+              child: SizedBox.shrink(),
+            ),
+            const SizedBox(height: 16),
+            Stack(
+              children: [
+                Column(
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Transform.translate(
+                                offset: const Offset(0, -16.3),
+                                child: RichText(
+                                  text: TextSpan(
+                                    style: const TextStyle(
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.w600,
+                                      color: Colors.black,
+                                    ),
+                                    children: [
+                                      const TextSpan(
+                                        text: 'Authorized Signature / ',
+                                      ),
+                                      TextSpan(
+                                        text: 'التوقيع المعتمد',
+                                        style: _arabicTextStyle(
+                                          fontSize: 10,
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                              Container(
+                                width: 170,
+                                height: 30,
+                                alignment: Alignment.centerLeft,
+                                child: showSignStamp
+                                    ? Image.asset(
+                                        'assets/sign.png',
+                                        width: 170,
+                                        height: 30,
+                                        fit: BoxFit.contain,
+                                        alignment: Alignment.centerLeft,
+                                        errorBuilder:
+                                            (context, error, stackTrace) =>
+                                                const SizedBox.shrink(),
+                                      )
+                                    : null,
+                              ),
+                              Transform.translate(
+                                offset: const Offset(0, -11.4),
+                                child: _buildDottedSignatureLine(),
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(width: 40),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.end,
+                            children: [
+                              Transform.translate(
+                                offset: const Offset(0, -16.3),
+                                child: RichText(
+                                  textAlign: TextAlign.right,
+                                  text: TextSpan(
+                                    style: const TextStyle(
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.w600,
+                                      color: Colors.black,
+                                    ),
+                                    children: [
+                                      const TextSpan(
+                                        text: 'Customer Signature / ',
+                                      ),
+                                      TextSpan(
+                                        text: 'توقيع العميل',
+                                        style: _arabicTextStyle(
+                                          fontSize: 10,
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(height: 30),
+                              Transform.translate(
+                                offset: const Offset(0, -11.4),
+                                child: _buildDottedSignatureLine(),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+                if (showSignStamp)
+                  Positioned(
+                    top: 0,
+                    bottom: 0,
+                    left: 0,
+                    right: 0,
+                    child: Center(
+                      child: Transform.translate(
+                        offset: const Offset(0, -19),
+                        child: Image.asset(
+                          'assets/stamp.png',
+                          width: 170,
+                          height: 68,
+                          errorBuilder: (context, error, stackTrace) => Text(
+                              'Stamp not found',
+                              style: TextStyle(color: Colors.red)),
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 4),
+
+            /// --- FOOTER SECTION ---
+            const Divider(
+              thickness: 1.5,
+              color: Colors.black,
+              height: 1,
+            ),
+            SizedBox(
+              height: 85,
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  SizedBox(
+                    width: 55,
+                    height: 55,
+                    child: FittedBox(
+                      fit: BoxFit.contain,
+                      child: _buildFooterQr(_leftQrUrl),
+                    ),
+                  ),
+                  Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text("الكويت - الراي - قطعة ١ - قسيمة ٢٦ - مبنى ١٤١٩",
+                          textDirection: TextDirection.rtl,
+                          style: _arabicTextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w500,
+                            height: 1.2,
+                          )),
+                      const Text(
+                          "Kuwait - Al Rai Block 1 - Street 26 - Building 1419",
+                          style: TextStyle(fontSize: 11, height: 1.2)),
+                      const Text("96952550 - 98532064 - 56540521",
+                          style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 12,
+                              height: 1.2)),
+                    ],
+                  ),
+                  SizedBox(
+                    width: 55,
+                    height: 55,
+                    child: FittedBox(
+                      fit: BoxFit.contain,
+                      child: _buildFooterQr(
+                        _rightQrUrl,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final isMobile = MediaQuery.of(context).size.width < 900;
@@ -2426,1946 +3355,523 @@ class _ContractState extends State<Contract> {
         },
         child: Focus(
           autofocus: true,
-          child: Scaffold(
-            drawer: isMobile
-                ? const Drawer(
-                    child: SafeArea(
-                      child: Sidebar(currentIndex: 1),
-                    ),
-                  )
-                : null,
-            floatingActionButton: isMobile
-                ? FloatingActionButton.extended(
-                    onPressed: () {
-                      showModalBottomSheet(
-                        context: context,
-                        isScrollControlled: true,
-                        builder: (_) => SafeArea(
-                          child: SizedBox(
-                            height: MediaQuery.of(context).size.height * 0.75,
-                            child: _buildHistoryPanel(width: double.infinity),
+          child: PopScope(
+            canPop: false,
+            onPopInvokedWithResult: (didPop, result) {
+              if (!didPop) {
+                Navigator.pushReplacement(
+                  context,
+                  PageRouteBuilder(
+                    transitionDuration: const Duration(milliseconds: 180),
+                    pageBuilder: (_, __, ___) => const Dashboard(),
+                    transitionsBuilder: (_, animation, __, child) =>
+                        FadeTransition(opacity: animation, child: child),
+                  ),
+                );
+              }
+            },
+            child: Scaffold(
+              backgroundColor: const Color(0xFFFFF8E1),
+              drawer: isMobile
+                  ? const Drawer(
+                      child: SafeArea(
+                        child: Sidebar(currentIndex: 1),
+                      ),
+                    )
+                  : null,
+              floatingActionButton: isMobile
+                  ? FloatingActionButton.extended(
+                      onPressed: () {
+                        showModalBottomSheet(
+                          context: context,
+                          isScrollControlled: true,
+                          builder: (_) => SafeArea(
+                            child: SizedBox(
+                              height: MediaQuery.of(context).size.height * 0.75,
+                              child: _buildHistoryPanel(width: double.infinity),
+                            ),
+                          ),
+                        );
+                      },
+                      icon: const Icon(Icons.history),
+                      label: const Text('History'),
+                    )
+                  : null,
+              bottomNavigationBar: isMobile
+                  ? SafeArea(
+                      top: false,
+                      child: Container(
+                        color: Colors.white,
+                        padding: const EdgeInsets.fromLTRB(10, 8, 10, 10),
+                        child: SingleChildScrollView(
+                          scrollDirection: Axis.horizontal,
+                          child: Row(
+                            children: [
+                              _buildMobileActionButton(
+                                'New',
+                                Colors.indigo,
+                                _startNewContract,
+                              ),
+                              const SizedBox(width: 8),
+                              // Signature & Stamp toggle
+                              ElevatedButton.icon(
+                                icon: Icon(
+                                  showSignStamp
+                                      ? Icons.visibility
+                                      : Icons.visibility_off,
+                                  color: Colors.white,
+                                  size: 16,
+                                ),
+                                label: Text(
+                                  showSignStamp ? 'Sign ON' : 'Sign OFF',
+                                  style: const TextStyle(
+                                      color: Colors.white, fontSize: 12),
+                                ),
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: showSignStamp
+                                      ? Colors.purple
+                                      : Colors.grey[700],
+                                  foregroundColor: Colors.white,
+                                  minimumSize: const Size(0, 38),
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 10, vertical: 10),
+                                  shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(10)),
+                                ),
+                                onPressed: () => setState(
+                                    () => showSignStamp = !showSignStamp),
+                              ),
+                              const SizedBox(width: 8),
+                              _buildMobileActionButton(
+                                'Print',
+                                Colors.blue,
+                                _printContract,
+                              ),
+                              const SizedBox(width: 8),
+                              _buildMobileActionButton(
+                                'Save PDF',
+                                const Color(0xFF249B28),
+                                () => _runButtonAction(
+                                    'Save PDF', _saveContractOnly),
+                              ),
+                              const SizedBox(width: 8),
+                              _buildMobileActionButton(
+                                'Download',
+                                Colors.blueAccent,
+                                () async {
+                                  setState(() {
+                                    currentPaperColor = const Color(0xFFFFFDD0);
+                                  });
+                                  await Future.delayed(
+                                      const Duration(milliseconds: 100));
+                                  await WidgetsBinding.instance.endOfFrame;
+                                  await downloadContractPDF(
+                                    context: context,
+                                    repaintKey: _contractBoundaryKey,
+                                  );
+                                  if (mounted) {
+                                    setState(() {
+                                      currentPaperColor = Colors.white;
+                                    });
+                                  }
+                                },
+                              ),
+                              const SizedBox(width: 8),
+                              ElevatedButton.icon(
+                                icon: const Icon(Icons.share),
+                                label: const Text('Share Contract'),
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: Colors.green,
+                                  foregroundColor: Colors.white,
+                                ),
+                                onPressed: () => _shareContractPdf(),
+                              ),
+                              const SizedBox(width: 8),
+                              _buildMobileActionButton(
+                                'Zoom -',
+                                Colors.teal,
+                                _zoomOutPage,
+                              ),
+                              const SizedBox(width: 8),
+                              _buildMobileActionButton(
+                                'Zoom +',
+                                Colors.teal,
+                                _zoomInPage,
+                              ),
+                              const SizedBox(width: 8),
+                              _buildMobileActionButton(
+                                'Reset',
+                                Colors.teal.shade700,
+                                _resetPageZoom,
+                              ),
+                              if (_isProcessing) ...[
+                                const SizedBox(width: 12),
+                                const SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child:
+                                      CircularProgressIndicator(strokeWidth: 2),
+                                ),
+                              ],
+                            ],
                           ),
                         ),
-                      );
-                    },
-                    icon: const Icon(Icons.history),
-                    label: const Text('History'),
-                  )
-                : null,
-            bottomNavigationBar: isMobile
-                ? SafeArea(
-                    top: false,
-                    child: Container(
-                      color: Colors.white,
-                      padding: const EdgeInsets.fromLTRB(10, 8, 10, 10),
-                      child: SingleChildScrollView(
-                        scrollDirection: Axis.horizontal,
-                        child: Row(
-                          children: [
-                            _buildMobileActionButton(
-                              'New',
-                              Colors.indigo,
-                              _startNewContract,
+                      ),
+                    )
+                  : null,
+              body: Column(
+                children: [
+                  // Hidden raw A4 widget for mobile capture — outside InteractiveViewer
+                  // so it always lays out at full A4 size, no FittedBox/constrained scaling
+                  Offstage(
+                    child: SizedBox(
+                      width: _a4PageWidth,
+                      height: _a4PageHeight,
+                      child: buildContractPaper(captureKey: _hiddenContractKey),
+                    ),
+                  ),
+                  if (isMobile)
+                    Container(
+                      height: 56,
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      decoration: const BoxDecoration(
+                        color: Colors.white,
+                        boxShadow: [
+                          BoxShadow(color: Colors.black12, blurRadius: 4)
+                        ],
+                      ),
+                      child: Row(
+                        children: [
+                          Builder(
+                            builder: (context) => IconButton(
+                              icon: const Icon(Icons.menu),
+                              onPressed: () =>
+                                  Scaffold.of(context).openDrawer(),
                             ),
-                            const SizedBox(width: 8),
-                            _buildMobileActionButton(
-                              'Print',
-                              Colors.blue,
-                              _printContract,
+                          ),
+                          const SizedBox(width: 8),
+                          const Text(
+                            'Contract',
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 16,
                             ),
-                            const SizedBox(width: 8),
-                            _buildMobileActionButton(
-                              'Save PDF',
-                              const Color(0xFF249B28),
-                              () => _runButtonAction(
-                                  'Save PDF', _saveContractOnly),
-                            ),
-                            const SizedBox(width: 8),
-                            _buildMobileActionButton(
-                              'Download',
-                              Colors.blueAccent,
-                              () => _runButtonAction(
-                                  'Download PDF', downloadContractFromServer),
-                            ),
-                            const SizedBox(width: 8),
-                            ElevatedButton.icon(
-                              icon: const Icon(Icons.share),
-                              label: const Text('Share Contract'),
-                              style: ElevatedButton.styleFrom(
-                                backgroundColor: Colors.green,
-                                foregroundColor: Colors.white,
-                              ),
-                              onPressed: () async {
-                                try {
-                                  // 1. Widget capture
-                                  final boundary = _contractBoundaryKey
-                                          .currentContext!
-                                          .findRenderObject()
-                                      as RenderRepaintBoundary;
-                                  final image =
-                                      await boundary.toImage(pixelRatio: 3.0);
-                                  final byteData = await image.toByteData(
-                                      format: ui.ImageByteFormat.png);
-                                  final pngBytes =
-                                      byteData!.buffer.asUint8List();
-
-                                  // 2. PDF banao (A4 perfect size)
-                                  final pdf = pw.Document();
-                                  final pdfImage = pw.MemoryImage(pngBytes);
-
-                                  pdf.addPage(
-                                    pw.Page(
-                                      pageFormat: PdfPageFormat.a4,
-                                      margin: pw.EdgeInsets.zero,
-                                      build: (pw.Context context) => pw.Center(
-                                          child: pw.Image(pdfImage,
-                                              fit: pw.BoxFit.contain)),
-                                    ),
-                                  );
-
-                                  final pdfBytes = await pdf.save();
-
-                                  final now = DateTime.now();
-                                  final fileName =
-                                      'taj_royal_contract_ 2${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}.pdf';
-
-                                  // 3. Smart logic → Web ya Mobile
-                                  if (kIsWeb) {
-                                    // Web pe download (tumhara existing function)
-                                    await downloadPdfBytes(pdfBytes, fileName);
-
-                                    if (context.mounted) {
-                                      ScaffoldMessenger.of(context)
-                                          .showSnackBar(
-                                        const SnackBar(
-                                          content: Text(
-                                              '✅ PDF downloaded! Downloads folder mein jaake share kar sakte ho'),
-                                          duration: Duration(seconds: 4),
-                                        ),
-                                      );
-                                    }
-                                  } else {
-                                    // Mobile pe asli Share Sheet
-                                    final output =
-                                        await getTemporaryDirectory();
-                                    final file =
-                                        File("${output.path}/$fileName");
-                                    await file.writeAsBytes(pdfBytes);
-
-                                    await Share.shareXFiles(
-                                      [XFile(file.path)],
-                                      text:
-                                          'Taj Royal Glass Co. - Contract Paper',
-                                    );
-
-                                    if (context.mounted) {
-                                      ScaffoldMessenger.of(context)
-                                          .showSnackBar(
-                                        const SnackBar(
-                                            content:
-                                                Text('Share sheet opened ✅')),
-                                      );
-                                    }
-                                  }
-                                } catch (e) {
-                                  print('Share Error: $e');
-                                  if (context.mounted) {
-                                    ScaffoldMessenger.of(context).showSnackBar(
-                                      SnackBar(content: Text('Error: $e')),
-                                    );
-                                  }
-                                }
-                              },
-                            ),
-                            const SizedBox(width: 8),
-                            _buildMobileActionButton(
-                              'Zoom -',
-                              Colors.teal,
-                              _zoomOutPage,
-                            ),
-                            const SizedBox(width: 8),
-                            _buildMobileActionButton(
-                              'Zoom +',
-                              Colors.teal,
-                              _zoomInPage,
-                            ),
-                            if (_isProcessing) ...[
-                              const SizedBox(width: 12),
-                              const SizedBox(
-                                width: 18,
-                                height: 18,
-                                child:
-                                    CircularProgressIndicator(strokeWidth: 2),
-                              ),
-                            ],
-                          ],
-                        ),
+                          ),
+                        ],
                       ),
                     ),
-                  )
-                : null,
-            body: Column(
-              children: [
-                if (isMobile)
-                  Container(
-                    height: 56,
-                    padding: const EdgeInsets.symmetric(horizontal: 8),
-                    decoration: const BoxDecoration(
-                      color: Colors.white,
-                      boxShadow: [
-                        BoxShadow(color: Colors.black12, blurRadius: 4)
-                      ],
-                    ),
+                  Expanded(
                     child: Row(
                       children: [
-                        Builder(
-                          builder: (context) => IconButton(
-                            icon: const Icon(Icons.menu),
-                            onPressed: () => Scaffold.of(context).openDrawer(),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        const Text(
-                          'Contract',
-                          style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                            fontSize: 16,
+                        /// 🔹 SIDEBAR
+                        if (!isMobile) const Sidebar(currentIndex: 1),
+                        if (!isMobile) _buildHistoryPanel(),
+
+                        /// 📄 MAIN AREA
+                        Expanded(
+                          child: Container(
+                            color: Colors.grey[300],
+                            child: Center(
+                              child: isMobile
+                                  ? LayoutBuilder(
+                                      builder: (ctx, cons) {
+                                        return SingleChildScrollView(
+                                          child: FittedBox(
+                                            fit: BoxFit.fitWidth,
+                                            alignment: Alignment.topCenter,
+                                            child: Row(
+                                              mainAxisAlignment:
+                                                  MainAxisAlignment.center,
+                                              crossAxisAlignment:
+                                                  CrossAxisAlignment.start,
+                                              children: [
+                                                /// 📄 A4 PAGE (Photo Design)
+                                                _buildZoomablePage(
+                                                  child: buildContractPaper(),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                        );
+                                      },
+                                    )
+                                  : Row(
+                                      mainAxisAlignment:
+                                          MainAxisAlignment.center,
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      children: [
+                                        /// 📄 A4 PAGE (Photo Design)
+                                        _buildZoomablePage(
+                                          child: buildContractPaper(),
+                                        ),
+
+                                        const SizedBox(width: 30),
+
+                                        /// 🔘 RIGHT SIDE BUTTONS
+                                        Padding(
+                                          padding:
+                                              const EdgeInsets.only(top: 80),
+                                          child: Column(
+                                            children: [
+                                              // ==================== DESKTOP/WEB - SIGNATURE & STAMP BUTTON ====================
+                                              ElevatedButton.icon(
+                                                onPressed: () {
+                                                  setState(() {
+                                                    showSignStamp =
+                                                        !showSignStamp;
+                                                  });
+                                                },
+                                                icon: Icon(
+                                                  showSignStamp
+                                                      ? Icons.visibility
+                                                      : Icons.visibility_off,
+                                                  color: Colors.white,
+                                                ),
+                                                label: Text(
+                                                  showSignStamp
+                                                      ? "Signature & Stamp ON"
+                                                      : "Signature & Stamp OFF",
+                                                  style: const TextStyle(
+                                                      fontWeight:
+                                                          FontWeight.bold),
+                                                ),
+                                                style: ElevatedButton.styleFrom(
+                                                  backgroundColor: showSignStamp
+                                                      ? Colors.purple
+                                                      : Colors.grey[700],
+                                                  foregroundColor: Colors.white,
+                                                  padding: const EdgeInsets
+                                                      .symmetric(
+                                                      horizontal: 24,
+                                                      vertical: 16),
+                                                  shape: RoundedRectangleBorder(
+                                                      borderRadius:
+                                                          BorderRadius.circular(
+                                                              12)),
+                                                  elevation: 4,
+                                                ),
+                                              ),
+                                              const SizedBox(height: 20),
+                                              _buildButton("Print", Colors.blue,
+                                                  _printContract),
+                                              const SizedBox(height: 20),
+                                              _buildButton(
+                                                  "Save PDF",
+                                                  const Color(0xFF249B28),
+                                                  () => _runButtonAction(
+                                                      'Save PDF',
+                                                      _saveContractOnly)),
+                                              const SizedBox(height: 20),
+                                              _buildButton(
+                                                  "Download PDF",
+                                                  Colors.blueAccent,
+                                                  () => _runButtonAction(
+                                                          'Download PDF',
+                                                          () async {
+                                                        // Step 1: Paper color cream karo
+                                                        setState(() {
+                                                          currentPaperColor =
+                                                              const Color(
+                                                                  0xFFFFFDD0);
+                                                        });
+
+                                                        // Step 2: Flutter ko redraw ka waqt do
+                                                        await Future.delayed(
+                                                            const Duration(
+                                                                milliseconds:
+                                                                    100));
+                                                        await WidgetsBinding
+                                                            .instance
+                                                            .endOfFrame;
+
+                                                        // Step 3: PDF generate + download
+                                                        await downloadContractPDF(
+                                                          context: context,
+                                                          repaintKey:
+                                                              _contractBoundaryKey,
+                                                        );
+
+                                                        // Step 4: Color wapas white
+                                                        if (mounted) {
+                                                          setState(() {
+                                                            currentPaperColor =
+                                                                Colors.white;
+                                                          });
+                                                        }
+                                                      })),
+                                              const SizedBox(height: 20),
+                                              ElevatedButton.icon(
+                                                icon: const Icon(Icons.share),
+                                                label: const Text(
+                                                    'Share Contract'),
+                                                style: ElevatedButton.styleFrom(
+                                                  backgroundColor: Colors.green,
+                                                  foregroundColor: Colors.white,
+                                                ),
+                                                onPressed: () async {
+                                                  try {
+                                                    // 1. Widget capture (high quality)
+                                                    setState(() {
+                                                      isDownloading = true;
+                                                    });
+
+                                                    await Future.delayed(
+                                                        const Duration(
+                                                            milliseconds: 300));
+                                                    await WidgetsBinding
+                                                        .instance.endOfFrame;
+
+                                                    final boundary =
+                                                        _contractBoundaryKey
+                                                                .currentContext!
+                                                                .findRenderObject()
+                                                            as RenderRepaintBoundary;
+                                                    final image =
+                                                        await boundary.toImage(
+                                                            pixelRatio:
+                                                                3.0); // 3.0 = sharp quality
+                                                    final byteData =
+                                                        await image.toByteData(
+                                                            format: ui
+                                                                .ImageByteFormat
+                                                                .png);
+                                                    final pngBytes = byteData!
+                                                        .buffer
+                                                        .asUint8List();
+
+                                                    // 2. PDF banao (exact A4 size)
+                                                    final pdf = pw.Document();
+                                                    final pdfImage =
+                                                        pw.MemoryImage(
+                                                            pngBytes);
+
+                                                    pdf.addPage(
+                                                      pw.Page(
+                                                        pageFormat:
+                                                            PdfPageFormat.a4,
+                                                        margin:
+                                                            pw.EdgeInsets.zero,
+                                                        build: (pw.Context
+                                                            context) {
+                                                          return pw.Center(
+                                                            child: pw.Image(
+                                                                pdfImage,
+                                                                fit: pw.BoxFit
+                                                                    .contain),
+                                                          );
+                                                        },
+                                                      ),
+                                                    );
+
+                                                    final pdfBytes =
+                                                        await pdf.save();
+
+                                                    // 3. File name
+                                                    final now = DateTime.now();
+                                                    final fileName =
+                                                        'taj_royal_contract_${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}.pdf';
+
+                                                    // 4. Share (Web + Mobile dono ke liye perfect)
+                                                    if (kIsWeb) {
+                                                      // Web pe direct download + share
+                                                      await Share.shareXFiles(
+                                                        [
+                                                          XFile.fromData(
+                                                              pdfBytes,
+                                                              mimeType:
+                                                                  'application/pdf',
+                                                              name: fileName)
+                                                        ],
+                                                        text:
+                                                            'Taj Royal Glass Co. - Contract Paper',
+                                                      );
+                                                    } else {
+                                                      // Mobile/Desktop
+                                                      final output =
+                                                          await getTemporaryDirectory();
+                                                      final file = File(
+                                                          "${output.path}/$fileName");
+                                                      await file.writeAsBytes(
+                                                          pdfBytes);
+
+                                                      await Share.shareXFiles(
+                                                        [XFile(file.path)],
+                                                        text:
+                                                            'Taj Royal Glass Co. - Contract Paper',
+                                                      );
+                                                    }
+
+                                                    if (context.mounted) {
+                                                      ScaffoldMessenger.of(
+                                                              context)
+                                                          .showSnackBar(
+                                                        const SnackBar(
+                                                            content: Text(
+                                                                'Share sheet opened ✅')),
+                                                      );
+                                                    }
+                                                  } catch (e) {
+                                                    print('Share Error: $e');
+                                                    if (context.mounted) {
+                                                      ScaffoldMessenger.of(
+                                                              context)
+                                                          .showSnackBar(
+                                                        SnackBar(
+                                                            content: Text(
+                                                                'Share failed: $e')),
+                                                      );
+                                                    }
+                                                  }
+
+                                                  if (mounted) {
+                                                    setState(() {
+                                                      isDownloading = false;
+                                                    });
+                                                  }
+                                                },
+                                              ),
+                                              const SizedBox(height: 20),
+                                              _buildButton(
+                                                "Zoom In",
+                                                Colors.teal,
+                                                _zoomInPage,
+                                              ),
+                                              const SizedBox(height: 20),
+                                              _buildButton(
+                                                "Zoom Out",
+                                                Colors.teal,
+                                                _zoomOutPage,
+                                              ),
+                                              const SizedBox(height: 20),
+                                              _buildButton(
+                                                "Reset Zoom",
+                                                Colors.teal.shade700,
+                                                _resetPageZoom,
+                                              ),
+                                              if (_isProcessing) ...[
+                                                const SizedBox(height: 20),
+                                                const SizedBox(
+                                                  width: 22,
+                                                  height: 22,
+                                                  child:
+                                                      CircularProgressIndicator(
+                                                          strokeWidth: 2),
+                                                ),
+                                              ],
+                                            ],
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                            ),
                           ),
                         ),
                       ],
                     ),
                   ),
-                Expanded(
-                  child: Row(
-                    children: [
-                      /// 🔹 SIDEBAR
-                      if (!isMobile) const Sidebar(currentIndex: 1),
-                      if (!isMobile) _buildHistoryPanel(),
-
-                      /// 📄 MAIN AREA
-                      Expanded(
-                        child: Container(
-                          color: Colors.grey[300],
-                          child: Center(
-                            child: isMobile
-                                ? Row(
-                                    mainAxisAlignment: MainAxisAlignment.center,
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      /// 📄 A4 PAGE (Photo Design)
-                                      _buildZoomablePage(
-                                        child: RepaintBoundary(
-                                          key: _contractBoundaryKey,
-                                          child: Container(
-                                            width: _a4PageWidth,
-                                            height: _a4PageHeight,
-                                            decoration: BoxDecoration(
-                                              color: Colors.white,
-                                              borderRadius:
-                                                  BorderRadius.circular(8),
-                                              boxShadow: const [
-                                                BoxShadow(
-                                                  color: Colors.black12,
-                                                  blurRadius: 10,
-                                                  offset: Offset(0, 5),
-                                                )
-                                              ],
-                                            ),
-                                            padding: const EdgeInsets.symmetric(
-                                                horizontal: 30, vertical: 20),
-                                            child: Column(
-                                              children: [
-                                                /// --- HEADER (Same as Photo) ---
-                                                Row(
-                                                  mainAxisAlignment:
-                                                      MainAxisAlignment
-                                                          .spaceBetween,
-                                                  crossAxisAlignment:
-                                                      CrossAxisAlignment.start,
-                                                  children: [
-                                                    // Left: English
-                                                    const Expanded(
-                                                      child: Column(
-                                                        crossAxisAlignment:
-                                                            CrossAxisAlignment
-                                                                .start,
-                                                        children: [
-                                                          Text(
-                                                              "Taj Royal Glass Co.",
-                                                              style: TextStyle(
-                                                                  fontWeight:
-                                                                      FontWeight
-                                                                          .bold,
-                                                                  fontSize:
-                                                                      18)),
-                                                          Text(
-                                                              "Mirror and Glass Manufacturing Factory",
-                                                              style: TextStyle(
-                                                                  fontSize:
-                                                                      10)),
-                                                        ],
-                                                      ),
-                                                    ),
-                                                    const SizedBox(width: 12),
-                                                    // Center: Logo Circle
-                                                    Container(
-                                                      width: 60,
-                                                      height: 60,
-                                                      decoration:
-                                                          const BoxDecoration(
-                                                        color: Colors
-                                                            .white, // 🔥 FORCE WHITE
-                                                        shape: BoxShape.circle,
-                                                      ),
-                                                      child: ClipOval(
-                                                        child: Image.asset(
-                                                          "assets/logo.png",
-                                                          fit: BoxFit.cover,
-                                                        ),
-                                                      ),
-                                                    ),
-
-                                                    const SizedBox(width: 12),
-                                                    Expanded(
-                                                      child: Column(
-                                                        crossAxisAlignment:
-                                                            CrossAxisAlignment
-                                                                .end,
-                                                        children: [
-                                                          Text(
-                                                              "شركة تـاج رويـال الزجاج",
-                                                              textDirection:
-                                                                  TextDirection
-                                                                      .rtl,
-                                                              textAlign:
-                                                                  TextAlign
-                                                                      .right,
-                                                              style:
-                                                                  _arabicTextStyle(
-                                                                fontSize: 18,
-                                                                fontWeight:
-                                                                    FontWeight
-                                                                        .bold,
-                                                              )),
-                                                          Text(
-                                                              "لتركيب الزجاج والمرايا والبراويز",
-                                                              textDirection:
-                                                                  TextDirection
-                                                                      .rtl,
-                                                              textAlign:
-                                                                  TextAlign
-                                                                      .right,
-                                                              style:
-                                                                  _arabicTextStyle(
-                                                                fontSize: 10,
-                                                                fontWeight:
-                                                                    FontWeight
-                                                                        .w500,
-                                                              )),
-                                                        ],
-                                                      ),
-                                                    ),
-                                                  ],
-                                                ),
-
-                                                const SizedBox(height: 22.7),
-
-                                                const Divider(
-                                                  height: 1,
-                                                  thickness: 1,
-                                                  color: Colors.black,
-                                                ),
-
-                                                Row(
-                                                  crossAxisAlignment:
-                                                      CrossAxisAlignment.start,
-                                                  children: [
-                                                    Expanded(
-                                                      child: Align(
-                                                        alignment:
-                                                            Alignment.topLeft,
-                                                        child: Container(
-                                                          padding:
-                                                              const EdgeInsets
-                                                                  .symmetric(
-                                                                  horizontal: 6,
-                                                                  vertical: 3),
-                                                          decoration:
-                                                              BoxDecoration(
-                                                            border: Border.all(
-                                                                width: 1,
-                                                                color: Colors
-                                                                    .black),
-                                                            borderRadius:
-                                                                const BorderRadius
-                                                                    .only(
-                                                              bottomRight:
-                                                                  Radius
-                                                                      .circular(
-                                                                          4),
-                                                            ),
-                                                          ),
-                                                          child: Column(
-                                                            mainAxisSize:
-                                                                MainAxisSize
-                                                                    .min,
-                                                            crossAxisAlignment:
-                                                                CrossAxisAlignment
-                                                                    .start,
-                                                            children: [
-                                                              RichText(
-                                                                text: TextSpan(
-                                                                  style:
-                                                                      const TextStyle(
-                                                                    fontSize: 7,
-                                                                    color: Colors
-                                                                        .grey,
-                                                                  ),
-                                                                  children: [
-                                                                    const TextSpan(
-                                                                        text:
-                                                                            'Date / '),
-                                                                    TextSpan(
-                                                                      text:
-                                                                          'التاريخ',
-                                                                      style:
-                                                                          _arabicTextStyle(
-                                                                        fontSize:
-                                                                            7,
-                                                                        fontWeight:
-                                                                            FontWeight.w500,
-                                                                        color: Colors
-                                                                            .grey,
-                                                                      ),
-                                                                    ),
-                                                                  ],
-                                                                ),
-                                                              ),
-                                                              Text(
-                                                                _contractDateTime,
-                                                                style: const TextStyle(
-                                                                    fontSize: 9,
-                                                                    fontWeight:
-                                                                        FontWeight
-                                                                            .bold),
-                                                              ),
-                                                            ],
-                                                          ),
-                                                        ),
-                                                      ),
-                                                    ),
-                                                    Transform.translate(
-                                                      offset:
-                                                          const Offset(0, -1),
-                                                      child: Container(
-                                                        padding:
-                                                            const EdgeInsets
-                                                                .symmetric(
-                                                                horizontal: 12,
-                                                                vertical: 4),
-                                                        decoration:
-                                                            const BoxDecoration(
-                                                          border: Border(
-                                                            left: BorderSide(
-                                                                width: 1),
-                                                            right: BorderSide(
-                                                                width: 1),
-                                                            bottom: BorderSide(
-                                                                width: 1),
-                                                          ),
-                                                          borderRadius:
-                                                              BorderRadius.only(
-                                                            bottomLeft:
-                                                                Radius.circular(
-                                                                    5),
-                                                            bottomRight:
-                                                                Radius.circular(
-                                                                    5),
-                                                          ),
-                                                        ),
-                                                        child: Column(
-                                                          children: [
-                                                            Text("عقد إتفاق",
-                                                                style:
-                                                                    _arabicTextStyle(
-                                                                  fontSize: 13,
-                                                                  fontWeight:
-                                                                      FontWeight
-                                                                          .bold,
-                                                                )),
-                                                            const Text(
-                                                                "Contract Paper",
-                                                                style:
-                                                                    TextStyle(
-                                                                  fontWeight:
-                                                                      FontWeight
-                                                                          .bold,
-                                                                  fontSize: 10,
-                                                                )),
-                                                          ],
-                                                        ),
-                                                      ),
-                                                    ),
-                                                    Expanded(
-                                                      child: Align(
-                                                        alignment:
-                                                            Alignment.topRight,
-                                                        child: Container(
-                                                          padding:
-                                                              const EdgeInsets
-                                                                  .symmetric(
-                                                                  horizontal: 6,
-                                                                  vertical: 3),
-                                                          decoration:
-                                                              BoxDecoration(
-                                                            border: Border.all(
-                                                                width: 1,
-                                                                color: Colors
-                                                                    .black),
-                                                            borderRadius:
-                                                                const BorderRadius
-                                                                    .only(
-                                                              bottomLeft: Radius
-                                                                  .circular(4),
-                                                            ),
-                                                          ),
-                                                          child: Column(
-                                                            mainAxisSize:
-                                                                MainAxisSize
-                                                                    .min,
-                                                            crossAxisAlignment:
-                                                                CrossAxisAlignment
-                                                                    .end,
-                                                            children: [
-                                                              RichText(
-                                                                textAlign:
-                                                                    TextAlign
-                                                                        .right,
-                                                                text: TextSpan(
-                                                                  style:
-                                                                      const TextStyle(
-                                                                    fontSize: 7,
-                                                                    color: Colors
-                                                                        .grey,
-                                                                  ),
-                                                                  children: [
-                                                                    const TextSpan(
-                                                                      text:
-                                                                          'Contract No. / ',
-                                                                    ),
-                                                                    TextSpan(
-                                                                      text:
-                                                                          'رقم العقد',
-                                                                      style:
-                                                                          _arabicTextStyle(
-                                                                        fontSize:
-                                                                            7,
-                                                                        fontWeight:
-                                                                            FontWeight.w500,
-                                                                        color: Colors
-                                                                            .grey,
-                                                                      ),
-                                                                    ),
-                                                                  ],
-                                                                ),
-                                                              ),
-                                                              Text(
-                                                                _contractNumber,
-                                                                style: const TextStyle(
-                                                                    fontSize: 9,
-                                                                    fontWeight:
-                                                                        FontWeight
-                                                                            .bold),
-                                                              ),
-                                                            ],
-                                                          ),
-                                                        ),
-                                                      ),
-                                                    ),
-                                                  ],
-                                                ),
-
-                                                const SizedBox(height: 8.5),
-
-                                                Column(
-                                                  children: [
-                                                    _buildSplitInfoBoxRow(
-                                                      englishLabel: 'Name',
-                                                      arabicLabel: 'الاسم',
-                                                      controller:
-                                                          _nameController,
-                                                      mirrorController:
-                                                          _nameArabicController,
-                                                      premiumStyle: true,
-                                                      labelFontSize: 8,
-                                                      valueFontSize: 10,
-                                                      valueFontWeight:
-                                                          FontWeight.w700,
-                                                    ),
-                                                    const SizedBox(height: 6),
-                                                    _buildSplitInfoBoxRow(
-                                                      englishLabel: 'Mobile',
-                                                      arabicLabel: 'الهاتف',
-                                                      controller:
-                                                          _mobileController,
-                                                      mirrorController:
-                                                          _mobileArabicController,
-                                                      keyboardType:
-                                                          TextInputType.phone,
-                                                      premiumStyle: true,
-                                                      labelFontSize: 8,
-                                                      valueFontSize: 10,
-                                                      valueFontWeight:
-                                                          FontWeight.w700,
-                                                    ),
-                                                    const SizedBox(height: 6),
-                                                    _buildSplitInfoBoxRow(
-                                                      englishLabel: 'Address',
-                                                      arabicLabel: 'العنوان',
-                                                      controller:
-                                                          _addressController,
-                                                      mirrorController:
-                                                          _addressArabicController,
-                                                      premiumStyle: true,
-                                                      labelFontSize: 8,
-                                                      valueFontSize: 10,
-                                                      valueFontWeight:
-                                                          FontWeight.w700,
-                                                    ),
-                                                    const SizedBox(height: 6),
-                                                    _buildSplitInfoBoxRow(
-                                                      englishLabel:
-                                                          'Description',
-                                                      arabicLabel: 'الوصف',
-                                                      controller:
-                                                          _descriptionController,
-                                                      mirrorController:
-                                                          _descriptionArabicController,
-                                                      rowHeight: 248,
-                                                      centerTallLabel: true,
-                                                      labelFontSize: 9,
-                                                      valueFontSize: 12,
-                                                      valueFontWeight:
-                                                          FontWeight.w700,
-                                                    ),
-                                                    const SizedBox(height: 18),
-                                                    _buildPaymentDetailsSplitBox(
-                                                      rowHeight: 136,
-                                                      premiumStyle: true,
-                                                      titleFontSize: 8.5,
-                                                      valueFontSize: 12.5,
-                                                      valueFontWeight:
-                                                          FontWeight.w700,
-                                                    ),
-                                                  ],
-                                                ),
-
-                                                const Expanded(
-                                                  child: SizedBox.shrink(),
-                                                ),
-                                                const SizedBox(height: 8),
-                                                Row(
-                                                  children: [
-                                                    Expanded(
-                                                      child: Column(
-                                                        crossAxisAlignment:
-                                                            CrossAxisAlignment
-                                                                .start,
-                                                        children: [
-                                                          Transform.translate(
-                                                            offset:
-                                                                const Offset(
-                                                                    0, -16.3),
-                                                            child: RichText(
-                                                              text: TextSpan(
-                                                                style:
-                                                                    const TextStyle(
-                                                                  fontSize: 10,
-                                                                  fontWeight:
-                                                                      FontWeight
-                                                                          .w600,
-                                                                  color: Colors
-                                                                      .black,
-                                                                ),
-                                                                children: [
-                                                                  const TextSpan(
-                                                                    text:
-                                                                        'Authorized Signature / ',
-                                                                  ),
-                                                                  TextSpan(
-                                                                    text:
-                                                                        'التوقيع المعتمد',
-                                                                    style:
-                                                                        _arabicTextStyle(
-                                                                      fontSize:
-                                                                          10,
-                                                                      fontWeight:
-                                                                          FontWeight
-                                                                              .w600,
-                                                                    ),
-                                                                  ),
-                                                                ],
-                                                              ),
-                                                            ),
-                                                          ),
-                                                          const SizedBox(
-                                                              height: 4),
-                                                          // Show sign image if enabled
-                                                          if (showSignStamp) ...[
-                                                            Text(
-                                                                'SIGNATURE IMAGE YAHAN HAI',
-                                                                style: TextStyle(
-                                                                    color: Colors
-                                                                        .red)),
-                                                            Padding(
-                                                              padding:
-                                                                  const EdgeInsets
-                                                                      .only(
-                                                                      bottom:
-                                                                          4),
-                                                              child:
-                                                                  Image.asset(
-                                                                'assets/sing.png',
-                                                                width: 90,
-                                                                height: 40,
-                                                                fit: BoxFit
-                                                                    .contain,
-                                                                errorBuilder: (context,
-                                                                        error,
-                                                                        stackTrace) =>
-                                                                    Text(
-                                                                        'Image not found',
-                                                                        style: TextStyle(
-                                                                            color:
-                                                                                Colors.red)),
-                                                              ),
-                                                            ),
-                                                          ],
-                                                          const SizedBox(
-                                                              height: 8),
-                                                          Transform.translate(
-                                                            offset:
-                                                                const Offset(
-                                                                    0, -11.4),
-                                                            child:
-                                                                _buildDottedSignatureLine(),
-                                                          ),
-                                                        ],
-                                                      ),
-                                                    ),
-                                                    const SizedBox(width: 40),
-                                                    Expanded(
-                                                      child: Column(
-                                                        crossAxisAlignment:
-                                                            CrossAxisAlignment
-                                                                .end,
-                                                        children: [
-                                                          Transform.translate(
-                                                            offset:
-                                                                const Offset(
-                                                                    0, -16.3),
-                                                            child: RichText(
-                                                              textAlign:
-                                                                  TextAlign
-                                                                      .right,
-                                                              text: TextSpan(
-                                                                style:
-                                                                    const TextStyle(
-                                                                  fontSize: 10,
-                                                                  fontWeight:
-                                                                      FontWeight
-                                                                          .w600,
-                                                                  color: Colors
-                                                                      .black,
-                                                                ),
-                                                                children: [
-                                                                  const TextSpan(
-                                                                    text:
-                                                                        'Customer Signature / ',
-                                                                  ),
-                                                                  TextSpan(
-                                                                    text:
-                                                                        'توقيع العميل',
-                                                                    style:
-                                                                        _arabicTextStyle(
-                                                                      fontSize:
-                                                                          10,
-                                                                      fontWeight:
-                                                                          FontWeight
-                                                                              .w600,
-                                                                    ),
-                                                                  ),
-                                                                ],
-                                                              ),
-                                                            ),
-                                                          ),
-                                                          const SizedBox(
-                                                              height: 4),
-                                                          // Show stamp image if enabled
-                                                          if (showSignStamp) ...[
-                                                            Text(
-                                                                'STAMP IMAGE YAHAN HAI',
-                                                                style: TextStyle(
-                                                                    color: Colors
-                                                                        .red)),
-                                                            Padding(
-                                                              padding:
-                                                                  const EdgeInsets
-                                                                      .only(
-                                                                      bottom:
-                                                                          4),
-                                                              child:
-                                                                  Image.asset(
-                                                                'assets/stamp.png',
-                                                                width: 60,
-                                                                height: 60,
-                                                                fit: BoxFit
-                                                                    .contain,
-                                                                errorBuilder: (context,
-                                                                        error,
-                                                                        stackTrace) =>
-                                                                    Text(
-                                                                        'Image not found',
-                                                                        style: TextStyle(
-                                                                            color:
-                                                                                Colors.red)),
-                                                              ),
-                                                            ),
-                                                          ],
-                                                          const SizedBox(
-                                                              height: 8),
-                                                          Transform.translate(
-                                                            offset:
-                                                                const Offset(
-                                                                    0, -11.4),
-                                                            child:
-                                                                _buildDottedSignatureLine(),
-                                                          ),
-                                                        ],
-                                                      ),
-                                                    ),
-                                                  ],
-                                                ),
-                                                const SizedBox(height: 4),
-
-                                                /// --- FOOTER SECTION ---
-                                                const Divider(
-                                                  thickness: 1.5,
-                                                  color: Colors.black,
-                                                  height: 1,
-                                                ),
-                                                SizedBox(
-                                                  height: 85,
-                                                  child: Row(
-                                                    mainAxisAlignment:
-                                                        MainAxisAlignment
-                                                            .spaceBetween,
-                                                    children: [
-                                                      SizedBox(
-                                                        width: 55,
-                                                        height: 55,
-                                                        child: FittedBox(
-                                                          fit: BoxFit.contain,
-                                                          child: _buildFooterQr(
-                                                            _leftQrUrl,
-                                                          ),
-                                                        ),
-                                                      ),
-                                                      Column(
-                                                        mainAxisAlignment:
-                                                            MainAxisAlignment
-                                                                .center,
-                                                        mainAxisSize:
-                                                            MainAxisSize.min,
-                                                        children: [
-                                                          Text(
-                                                              "الكويت - الراي - قطعة ١ - قسيمة ٢٦ - مبنى ١٤١٩",
-                                                              textDirection:
-                                                                  TextDirection
-                                                                      .rtl,
-                                                              style:
-                                                                  _arabicTextStyle(
-                                                                fontSize: 11,
-                                                                fontWeight:
-                                                                    FontWeight
-                                                                        .w500,
-                                                                height: 1.2,
-                                                              )),
-                                                          const Text(
-                                                              "Kuwait - Al Rai Block 1 - Street 26 - Building 1419",
-                                                              style: TextStyle(
-                                                                  fontSize: 11,
-                                                                  height: 1.2)),
-                                                          const Text(
-                                                              "96952550 - 98532064 - 56540521",
-                                                              style: TextStyle(
-                                                                  fontWeight:
-                                                                      FontWeight
-                                                                          .bold,
-                                                                  fontSize: 12,
-                                                                  height: 1.2)),
-                                                        ],
-                                                      ),
-                                                      SizedBox(
-                                                        width: 55,
-                                                        height: 55,
-                                                        child: FittedBox(
-                                                          fit: BoxFit.contain,
-                                                          child: _buildFooterQr(
-                                                            _rightQrUrl,
-                                                          ),
-                                                        ),
-                                                      ),
-                                                    ],
-                                                  ),
-                                                ),
-                                              ],
-                                            ),
-                                          ),
-                                        ),
-                                      ),
-
-                                      const SizedBox(width: 30),
-
-                                      /// 🔘 RIGHT SIDE BUTTONS
-                                      Padding(
-                                        padding: const EdgeInsets.only(top: 80),
-                                        child: Column(
-                                          children: [
-                                            _buildButton(
-                                                "New Contract",
-                                                Colors.indigo,
-                                                _startNewContract),
-                                            const SizedBox(height: 20),
-                                            _buildButton("Print", Colors.blue,
-                                                _printContract),
-                                            const SizedBox(height: 20),
-                                            _buildButton(
-                                                "Save PDF",
-                                                const Color(0xFF249B28),
-                                                () => _runButtonAction(
-                                                    'Save PDF',
-                                                    _saveContractOnly)),
-                                            const SizedBox(height: 20),
-                                            _buildButton(
-                                                "Download PDF",
-                                                Colors.blueAccent,
-                                                () => _runButtonAction(
-                                                    'Download PDF',
-                                                    downloadContractFromServer)),
-                                            const SizedBox(height: 20),
-                                            ElevatedButton.icon(
-                                              icon: const Icon(Icons.share),
-                                              label:
-                                                  const Text('Share Contract'),
-                                              style: ElevatedButton.styleFrom(
-                                                backgroundColor: Colors.green,
-                                                foregroundColor: Colors.white,
-                                              ),
-                                              onPressed: () async {
-                                                try {
-                                                  // 1. Widget capture (high quality)
-                                                  final boundary =
-                                                      _contractBoundaryKey
-                                                              .currentContext!
-                                                              .findRenderObject()
-                                                          as RenderRepaintBoundary;
-                                                  final image =
-                                                      await boundary.toImage(
-                                                          pixelRatio:
-                                                              3.0); // 3.0 = sharp quality
-                                                  final byteData =
-                                                      await image.toByteData(
-                                                          format: ui
-                                                              .ImageByteFormat
-                                                              .png);
-                                                  final pngBytes = byteData!
-                                                      .buffer
-                                                      .asUint8List();
-
-                                                  // 2. PDF banao (exact A4 size)
-                                                  final pdf = pw.Document();
-                                                  final pdfImage =
-                                                      pw.MemoryImage(pngBytes);
-
-                                                  pdf.addPage(
-                                                    pw.Page(
-                                                      pageFormat:
-                                                          PdfPageFormat.a4,
-                                                      margin:
-                                                          pw.EdgeInsets.zero,
-                                                      build:
-                                                          (pw.Context context) {
-                                                        return pw.Center(
-                                                          child: pw.Image(
-                                                              pdfImage,
-                                                              fit: pw.BoxFit
-                                                                  .contain),
-                                                        );
-                                                      },
-                                                    ),
-                                                  );
-
-                                                  final pdfBytes =
-                                                      await pdf.save();
-
-                                                  // 3. File name
-                                                  final now = DateTime.now();
-                                                  final fileName =
-                                                      'taj_royal_contract_${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}.pdf';
-
-                                                  // 4. Share (Web + Mobile dono ke liye perfect)
-                                                  if (kIsWeb) {
-                                                    // Web pe direct download + share
-                                                    await Share.shareXFiles(
-                                                      [
-                                                        XFile.fromData(pdfBytes,
-                                                            mimeType:
-                                                                'application/pdf',
-                                                            name: fileName)
-                                                      ],
-                                                      text:
-                                                          'Taj Royal Glass Co. - Contract Paper',
-                                                    );
-                                                  } else {
-                                                    // Mobile/Desktop
-                                                    final output =
-                                                        await getTemporaryDirectory();
-                                                    final file = File(
-                                                        "${output.path}/$fileName");
-                                                    await file
-                                                        .writeAsBytes(pdfBytes);
-
-                                                    await Share.shareXFiles(
-                                                      [XFile(file.path)],
-                                                      text:
-                                                          'Taj Royal Glass Co. - Contract Paper',
-                                                    );
-                                                  }
-
-                                                  if (context.mounted) {
-                                                    ScaffoldMessenger.of(
-                                                            context)
-                                                        .showSnackBar(
-                                                      const SnackBar(
-                                                          content: Text(
-                                                              'Share sheet opened ✅')),
-                                                    );
-                                                  }
-                                                } catch (e) {
-                                                  print('Share Error: $e');
-                                                  if (context.mounted) {
-                                                    ScaffoldMessenger.of(
-                                                            context)
-                                                        .showSnackBar(
-                                                      SnackBar(
-                                                          content: Text(
-                                                              'Share failed: $e')),
-                                                    );
-                                                  }
-                                                }
-                                              },
-                                            ),
-                                            const SizedBox(height: 20),
-                                            _buildButton(
-                                              "Zoom In",
-                                              Colors.teal,
-                                              _zoomInPage,
-                                            ),
-                                            const SizedBox(height: 20),
-                                            _buildButton(
-                                              "Zoom Out",
-                                              Colors.teal,
-                                              _zoomOutPage,
-                                            ),
-                                            const SizedBox(height: 20),
-                                            _buildButton(
-                                              "Reset Zoom",
-                                              Colors.teal.shade700,
-                                              _resetPageZoom,
-                                            ),
-                                            const SizedBox(height: 20),
-
-                                            // ==================== NAYA SIGNATURE & STAMP BUTTON ====================
-                                            ElevatedButton.icon(
-                                              onPressed: () {
-                                                setState(() {
-                                                  showSignStamp =
-                                                      !showSignStamp;
-                                                });
-                                              },
-                                              icon: Icon(
-                                                showSignStamp
-                                                    ? Icons.visibility
-                                                    : Icons.visibility_off,
-                                                color: Colors.white,
-                                              ),
-                                              label: Text(
-                                                showSignStamp
-                                                    ? "Signature & Stamp ON"
-                                                    : "Signature & Stamp OFF",
-                                                style: const TextStyle(
-                                                    fontWeight: FontWeight.bold,
-                                                    fontSize: 15),
-                                              ),
-                                              style: ElevatedButton.styleFrom(
-                                                backgroundColor: showSignStamp
-                                                    ? Colors.purple
-                                                    : Colors.grey[700],
-                                                foregroundColor: Colors.white,
-                                                padding:
-                                                    const EdgeInsets.symmetric(
-                                                        horizontal: 24,
-                                                        vertical: 16),
-                                                shape: RoundedRectangleBorder(
-                                                  borderRadius:
-                                                      BorderRadius.circular(12),
-                                                ),
-                                                elevation: 5,
-                                              ),
-                                            ),
-                                            if (_isProcessing) ...[
-                                              const SizedBox(height: 20),
-                                              const SizedBox(
-                                                width: 22,
-                                                height: 22,
-                                                child:
-                                                    CircularProgressIndicator(
-                                                        strokeWidth: 2),
-                                              ),
-                                            ],
-                                          ],
-                                        ),
-                                      ),
-                                    ],
-                                  )
-                                : Row(
-                                    mainAxisAlignment: MainAxisAlignment.center,
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      /// 📄 A4 PAGE (Photo Design)
-                                      _buildZoomablePage(
-                                        child: RepaintBoundary(
-                                          key: _contractBoundaryKey,
-                                          child: Container(
-                                            width: _a4PageWidth,
-                                            height: _a4PageHeight,
-                                            decoration: BoxDecoration(
-                                              color: Colors.white,
-                                              borderRadius:
-                                                  BorderRadius.circular(8),
-                                              boxShadow: const [
-                                                BoxShadow(
-                                                  color: Colors.black12,
-                                                  blurRadius: 10,
-                                                  offset: Offset(0, 5),
-                                                )
-                                              ],
-                                            ),
-                                            padding: const EdgeInsets.symmetric(
-                                                horizontal: 30, vertical: 20),
-                                            child: Column(
-                                              children: [
-                                                /// --- HEADER (Same as Photo) ---
-                                                Row(
-                                                  mainAxisAlignment:
-                                                      MainAxisAlignment
-                                                          .spaceBetween,
-                                                  crossAxisAlignment:
-                                                      CrossAxisAlignment.start,
-                                                  children: [
-                                                    // Left: English
-                                                    const Expanded(
-                                                      child: Column(
-                                                        crossAxisAlignment:
-                                                            CrossAxisAlignment
-                                                                .start,
-                                                        children: [
-                                                          Text(
-                                                              "Taj Royal Glass Co.",
-                                                              style: TextStyle(
-                                                                  fontWeight:
-                                                                      FontWeight
-                                                                          .bold,
-                                                                  fontSize:
-                                                                      18)),
-                                                          Text(
-                                                              "Mirror and Glass Manufacturing Factory",
-                                                              style: TextStyle(
-                                                                  fontSize:
-                                                                      10)),
-                                                        ],
-                                                      ),
-                                                    ),
-                                                    const SizedBox(width: 12),
-                                                    // Center: Logo Circle
-                                                    Container(
-                                                      width: 60,
-                                                      height: 60,
-                                                      decoration:
-                                                          const BoxDecoration(
-                                                        color: Colors
-                                                            .white, // 🔥 FORCE WHITE
-                                                        shape: BoxShape.circle,
-                                                      ),
-                                                      child: ClipOval(
-                                                        child: Image.asset(
-                                                          "assets/logo.png",
-                                                          fit: BoxFit.cover,
-                                                        ),
-                                                      ),
-                                                    ),
-
-                                                    const SizedBox(width: 12),
-                                                    Expanded(
-                                                      child: Column(
-                                                        crossAxisAlignment:
-                                                            CrossAxisAlignment
-                                                                .end,
-                                                        children: [
-                                                          Text(
-                                                              "شركة تـاج رويـال الزجاج",
-                                                              textDirection:
-                                                                  TextDirection
-                                                                      .rtl,
-                                                              textAlign:
-                                                                  TextAlign
-                                                                      .right,
-                                                              style:
-                                                                  _arabicTextStyle(
-                                                                fontSize: 18,
-                                                                fontWeight:
-                                                                    FontWeight
-                                                                        .bold,
-                                                              )),
-                                                          Text(
-                                                              "لتركيب الزجاج والمرايا والبراويز",
-                                                              textDirection:
-                                                                  TextDirection
-                                                                      .rtl,
-                                                              textAlign:
-                                                                  TextAlign
-                                                                      .right,
-                                                              style:
-                                                                  _arabicTextStyle(
-                                                                fontSize: 10,
-                                                                fontWeight:
-                                                                    FontWeight
-                                                                        .w500,
-                                                              )),
-                                                        ],
-                                                      ),
-                                                    ),
-                                                  ],
-                                                ),
-
-                                                const SizedBox(height: 22.7),
-
-                                                const Divider(
-                                                  height: 1,
-                                                  thickness: 1,
-                                                  color: Colors.black,
-                                                ),
-
-                                                Row(
-                                                  crossAxisAlignment:
-                                                      CrossAxisAlignment.start,
-                                                  children: [
-                                                    Expanded(
-                                                      child: Align(
-                                                        alignment:
-                                                            Alignment.topLeft,
-                                                        child: Container(
-                                                          padding:
-                                                              const EdgeInsets
-                                                                  .symmetric(
-                                                                  horizontal: 6,
-                                                                  vertical: 3),
-                                                          decoration:
-                                                              BoxDecoration(
-                                                            border: Border.all(
-                                                                width: 1,
-                                                                color: Colors
-                                                                    .black),
-                                                            borderRadius:
-                                                                const BorderRadius
-                                                                    .only(
-                                                              bottomRight:
-                                                                  Radius
-                                                                      .circular(
-                                                                          4),
-                                                            ),
-                                                          ),
-                                                          child: Column(
-                                                            mainAxisSize:
-                                                                MainAxisSize
-                                                                    .min,
-                                                            crossAxisAlignment:
-                                                                CrossAxisAlignment
-                                                                    .start,
-                                                            children: [
-                                                              RichText(
-                                                                text: TextSpan(
-                                                                  style:
-                                                                      const TextStyle(
-                                                                    fontSize: 7,
-                                                                    color: Colors
-                                                                        .grey,
-                                                                  ),
-                                                                  children: [
-                                                                    const TextSpan(
-                                                                        text:
-                                                                            'Date / '),
-                                                                    TextSpan(
-                                                                      text:
-                                                                          'التاريخ',
-                                                                      style:
-                                                                          _arabicTextStyle(
-                                                                        fontSize:
-                                                                            7,
-                                                                        fontWeight:
-                                                                            FontWeight.w500,
-                                                                        color: Colors
-                                                                            .grey,
-                                                                      ),
-                                                                    ),
-                                                                  ],
-                                                                ),
-                                                              ),
-                                                              Text(
-                                                                _contractDateTime,
-                                                                style: const TextStyle(
-                                                                    fontSize: 9,
-                                                                    fontWeight:
-                                                                        FontWeight
-                                                                            .bold),
-                                                              ),
-                                                            ],
-                                                          ),
-                                                        ),
-                                                      ),
-                                                    ),
-                                                    Transform.translate(
-                                                      offset:
-                                                          const Offset(0, -1),
-                                                      child: Container(
-                                                        padding:
-                                                            const EdgeInsets
-                                                                .symmetric(
-                                                                horizontal: 12,
-                                                                vertical: 4),
-                                                        decoration:
-                                                            const BoxDecoration(
-                                                          border: Border(
-                                                            left: BorderSide(
-                                                                width: 1),
-                                                            right: BorderSide(
-                                                                width: 1),
-                                                            bottom: BorderSide(
-                                                                width: 1),
-                                                          ),
-                                                          borderRadius:
-                                                              BorderRadius.only(
-                                                            bottomLeft:
-                                                                Radius.circular(
-                                                                    5),
-                                                            bottomRight:
-                                                                Radius.circular(
-                                                                    5),
-                                                          ),
-                                                        ),
-                                                        child: Column(
-                                                          children: [
-                                                            Text("عقد إتفاق",
-                                                                style:
-                                                                    _arabicTextStyle(
-                                                                  fontSize: 13,
-                                                                  fontWeight:
-                                                                      FontWeight
-                                                                          .bold,
-                                                                )),
-                                                            const Text(
-                                                                "Contract Paper",
-                                                                style:
-                                                                    TextStyle(
-                                                                  fontWeight:
-                                                                      FontWeight
-                                                                          .bold,
-                                                                  fontSize: 10,
-                                                                )),
-                                                          ],
-                                                        ),
-                                                      ),
-                                                    ),
-                                                    Expanded(
-                                                      child: Align(
-                                                        alignment:
-                                                            Alignment.topRight,
-                                                        child: Container(
-                                                          padding:
-                                                              const EdgeInsets
-                                                                  .symmetric(
-                                                                  horizontal: 6,
-                                                                  vertical: 3),
-                                                          decoration:
-                                                              BoxDecoration(
-                                                            border: Border.all(
-                                                                width: 1,
-                                                                color: Colors
-                                                                    .black),
-                                                            borderRadius:
-                                                                const BorderRadius
-                                                                    .only(
-                                                              bottomLeft: Radius
-                                                                  .circular(4),
-                                                            ),
-                                                          ),
-                                                          child: Column(
-                                                            mainAxisSize:
-                                                                MainAxisSize
-                                                                    .min,
-                                                            crossAxisAlignment:
-                                                                CrossAxisAlignment
-                                                                    .end,
-                                                            children: [
-                                                              RichText(
-                                                                textAlign:
-                                                                    TextAlign
-                                                                        .right,
-                                                                text: TextSpan(
-                                                                  style:
-                                                                      const TextStyle(
-                                                                    fontSize: 7,
-                                                                    color: Colors
-                                                                        .grey,
-                                                                  ),
-                                                                  children: [
-                                                                    const TextSpan(
-                                                                      text:
-                                                                          'Contract No. / ',
-                                                                    ),
-                                                                    TextSpan(
-                                                                      text:
-                                                                          'رقم العقد',
-                                                                      style:
-                                                                          _arabicTextStyle(
-                                                                        fontSize:
-                                                                            7,
-                                                                        fontWeight:
-                                                                            FontWeight.w500,
-                                                                        color: Colors
-                                                                            .grey,
-                                                                      ),
-                                                                    ),
-                                                                  ],
-                                                                ),
-                                                              ),
-                                                              Text(
-                                                                _contractNumber,
-                                                                style: const TextStyle(
-                                                                    fontSize: 9,
-                                                                    fontWeight:
-                                                                        FontWeight
-                                                                            .bold),
-                                                              ),
-                                                            ],
-                                                          ),
-                                                        ),
-                                                      ),
-                                                    ),
-                                                  ],
-                                                ),
-
-                                                const SizedBox(height: 8.5),
-
-                                                Column(
-                                                  children: [
-                                                    _buildSplitInfoBoxRow(
-                                                      englishLabel: 'Name',
-                                                      arabicLabel: 'الاسم',
-                                                      controller:
-                                                          _nameController,
-                                                      mirrorController:
-                                                          _nameArabicController,
-                                                      premiumStyle: true,
-                                                      labelFontSize: 8,
-                                                      valueFontSize: 10,
-                                                      valueFontWeight:
-                                                          FontWeight.w700,
-                                                    ),
-                                                    const SizedBox(height: 6),
-                                                    _buildSplitInfoBoxRow(
-                                                      englishLabel: 'Mobile',
-                                                      arabicLabel: 'الهاتف',
-                                                      controller:
-                                                          _mobileController,
-                                                      mirrorController:
-                                                          _mobileArabicController,
-                                                      keyboardType:
-                                                          TextInputType.phone,
-                                                      premiumStyle: true,
-                                                      labelFontSize: 8,
-                                                      valueFontSize: 10,
-                                                      valueFontWeight:
-                                                          FontWeight.w700,
-                                                    ),
-                                                    const SizedBox(height: 6),
-                                                    _buildSplitInfoBoxRow(
-                                                      englishLabel: 'Address',
-                                                      arabicLabel: 'العنوان',
-                                                      controller:
-                                                          _addressController,
-                                                      mirrorController:
-                                                          _addressArabicController,
-                                                      premiumStyle: true,
-                                                      labelFontSize: 8,
-                                                      valueFontSize: 10,
-                                                      valueFontWeight:
-                                                          FontWeight.w700,
-                                                    ),
-                                                    const SizedBox(height: 6),
-                                                    _buildSplitInfoBoxRow(
-                                                      englishLabel:
-                                                          'Description',
-                                                      arabicLabel: 'الوصف',
-                                                      controller:
-                                                          _descriptionController,
-                                                      mirrorController:
-                                                          _descriptionArabicController,
-                                                      rowHeight: 248,
-                                                      centerTallLabel: true,
-                                                      labelFontSize: 9,
-                                                      valueFontSize: 12,
-                                                      valueFontWeight:
-                                                          FontWeight.w700,
-                                                    ),
-                                                    const SizedBox(height: 18),
-                                                    _buildPaymentDetailsSplitBox(
-                                                      rowHeight: 136,
-                                                      premiumStyle: true,
-                                                      titleFontSize: 8.5,
-                                                      valueFontSize: 12.5,
-                                                      valueFontWeight:
-                                                          FontWeight.w700,
-                                                    ),
-                                                  ],
-                                                ),
-
-                                                const Expanded(
-                                                  child: SizedBox.shrink(),
-                                                ),
-                                                const SizedBox(height: 8),
-                                                Row(
-                                                  children: [
-                                                    Expanded(
-                                                      child: Column(
-                                                        crossAxisAlignment:
-                                                            CrossAxisAlignment
-                                                                .start,
-                                                        children: [
-                                                          Transform.translate(
-                                                            offset:
-                                                                const Offset(
-                                                                    0, -16.3),
-                                                            child: RichText(
-                                                              text: TextSpan(
-                                                                style:
-                                                                    const TextStyle(
-                                                                  fontSize: 10,
-                                                                  fontWeight:
-                                                                      FontWeight
-                                                                          .w600,
-                                                                  color: Colors
-                                                                      .black,
-                                                                ),
-                                                                children: [
-                                                                  const TextSpan(
-                                                                    text:
-                                                                        'Authorized Signature / ',
-                                                                  ),
-                                                                  TextSpan(
-                                                                    text:
-                                                                        'التوقيع المعتمد',
-                                                                    style:
-                                                                        _arabicTextStyle(
-                                                                      fontSize:
-                                                                          10,
-                                                                      fontWeight:
-                                                                          FontWeight
-                                                                              .w600,
-                                                                    ),
-                                                                  ),
-                                                                ],
-                                                              ),
-                                                            ),
-                                                          ),
-                                                          const SizedBox(
-                                                              height: 12),
-                                                          Transform.translate(
-                                                            offset:
-                                                                const Offset(
-                                                                    0, -11.4),
-                                                            child:
-                                                                _buildDottedSignatureLine(),
-                                                          ),
-                                                        ],
-                                                      ),
-                                                    ),
-                                                    const SizedBox(width: 40),
-                                                    Expanded(
-                                                      child: Column(
-                                                        crossAxisAlignment:
-                                                            CrossAxisAlignment
-                                                                .end,
-                                                        children: [
-                                                          Transform.translate(
-                                                            offset:
-                                                                const Offset(
-                                                                    0, -16.3),
-                                                            child: RichText(
-                                                              textAlign:
-                                                                  TextAlign
-                                                                      .right,
-                                                              text: TextSpan(
-                                                                style:
-                                                                    const TextStyle(
-                                                                  fontSize: 10,
-                                                                  fontWeight:
-                                                                      FontWeight
-                                                                          .w600,
-                                                                  color: Colors
-                                                                      .black,
-                                                                ),
-                                                                children: [
-                                                                  const TextSpan(
-                                                                    text:
-                                                                        'Customer Signature / ',
-                                                                  ),
-                                                                  TextSpan(
-                                                                    text:
-                                                                        'توقيع العميل',
-                                                                    style:
-                                                                        _arabicTextStyle(
-                                                                      fontSize:
-                                                                          10,
-                                                                      fontWeight:
-                                                                          FontWeight
-                                                                              .w600,
-                                                                    ),
-                                                                  ),
-                                                                ],
-                                                              ),
-                                                            ),
-                                                          ),
-                                                          const SizedBox(
-                                                              height: 12),
-                                                          Transform.translate(
-                                                            offset:
-                                                                const Offset(
-                                                                    0, -11.4),
-                                                            child:
-                                                                _buildDottedSignatureLine(),
-                                                          ),
-                                                        ],
-                                                      ),
-                                                    ),
-                                                  ],
-                                                ),
-                                                const SizedBox(height: 4),
-
-                                                /// --- FOOTER SECTION ---
-                                                const Divider(
-                                                  thickness: 1.5,
-                                                  color: Colors.black,
-                                                  height: 1,
-                                                ),
-                                                SizedBox(
-                                                  height: 85,
-                                                  child: Row(
-                                                    mainAxisAlignment:
-                                                        MainAxisAlignment
-                                                            .spaceBetween,
-                                                    children: [
-                                                      SizedBox(
-                                                        width: 55,
-                                                        height: 55,
-                                                        child: FittedBox(
-                                                          fit: BoxFit.contain,
-                                                          child: _buildFooterQr(
-                                                              _leftQrUrl),
-                                                        ),
-                                                      ),
-                                                      Column(
-                                                        mainAxisAlignment:
-                                                            MainAxisAlignment
-                                                                .center,
-                                                        mainAxisSize:
-                                                            MainAxisSize.min,
-                                                        children: [
-                                                          Text(
-                                                              "الكويت - الراي - قطعة ١ - قسيمة ٢٦ - مبنى ١٤١٩",
-                                                              textDirection:
-                                                                  TextDirection
-                                                                      .rtl,
-                                                              style:
-                                                                  _arabicTextStyle(
-                                                                fontSize: 11,
-                                                                fontWeight:
-                                                                    FontWeight
-                                                                        .w500,
-                                                                height: 1.2,
-                                                              )),
-                                                          const Text(
-                                                              "Kuwait - Al Rai Block 1 - Street 26 - Building 1419",
-                                                              style: TextStyle(
-                                                                  fontSize: 11,
-                                                                  height: 1.2)),
-                                                          const Text(
-                                                              "96952550 - 98532064 - 56540521",
-                                                              style: TextStyle(
-                                                                  fontWeight:
-                                                                      FontWeight
-                                                                          .bold,
-                                                                  fontSize: 12,
-                                                                  height: 1.2)),
-                                                        ],
-                                                      ),
-                                                      SizedBox(
-                                                        width: 55,
-                                                        height: 55,
-                                                        child: FittedBox(
-                                                          fit: BoxFit.contain,
-                                                          child: _buildFooterQr(
-                                                            _rightQrUrl,
-                                                          ),
-                                                        ),
-                                                      ),
-                                                    ],
-                                                  ),
-                                                ),
-                                              ],
-                                            ),
-                                          ),
-                                        ),
-                                      ),
-
-                                      const SizedBox(width: 30),
-
-                                      /// 🔘 RIGHT SIDE BUTTONS
-                                      Padding(
-                                        padding: const EdgeInsets.only(top: 80),
-                                        child: Column(
-                                          children: [
-                                            // ==================== DESKTOP/WEB - SIGNATURE & STAMP BUTTON ====================
-                                            ElevatedButton.icon(
-                                              onPressed: () {
-                                                setState(() {
-                                                  showSignStamp =
-                                                      !showSignStamp;
-                                                });
-                                              },
-                                              icon: Icon(
-                                                showSignStamp
-                                                    ? Icons.visibility
-                                                    : Icons.visibility_off,
-                                                color: Colors.white,
-                                              ),
-                                              label: Text(
-                                                showSignStamp
-                                                    ? "Signature & Stamp ON"
-                                                    : "Signature & Stamp OFF",
-                                                style: const TextStyle(
-                                                    fontWeight:
-                                                        FontWeight.bold),
-                                              ),
-                                              style: ElevatedButton.styleFrom(
-                                                backgroundColor: showSignStamp
-                                                    ? Colors.purple
-                                                    : Colors.grey[700],
-                                                foregroundColor: Colors.white,
-                                                padding:
-                                                    const EdgeInsets.symmetric(
-                                                        horizontal: 24,
-                                                        vertical: 16),
-                                                shape: RoundedRectangleBorder(
-                                                    borderRadius:
-                                                        BorderRadius.circular(
-                                                            12)),
-                                                elevation: 4,
-                                              ),
-                                            ),
-                                            const SizedBox(height: 20),
-                                            _buildButton("Print", Colors.blue,
-                                                _printContract),
-                                            const SizedBox(height: 20),
-                                            _buildButton(
-                                                "Save PDF",
-                                                const Color(0xFF249B28),
-                                                () => _runButtonAction(
-                                                    'Save PDF',
-                                                    _saveContractOnly)),
-                                            const SizedBox(height: 20),
-                                            _buildButton(
-                                                "Download PDF",
-                                                Colors.blueAccent,
-                                                () => _runButtonAction(
-                                                    'Download PDF',
-                                                    downloadContractFromServer)),
-                                            const SizedBox(height: 20),
-                                            ElevatedButton.icon(
-                                              icon: const Icon(Icons.share),
-                                              label:
-                                                  const Text('Share Contract'),
-                                              style: ElevatedButton.styleFrom(
-                                                backgroundColor: Colors.green,
-                                                foregroundColor: Colors.white,
-                                              ),
-                                              onPressed: () async {
-                                                try {
-                                                  // 1. Widget capture (high quality)
-                                                  final boundary =
-                                                      _contractBoundaryKey
-                                                              .currentContext!
-                                                              .findRenderObject()
-                                                          as RenderRepaintBoundary;
-                                                  final image =
-                                                      await boundary.toImage(
-                                                          pixelRatio:
-                                                              3.0); // 3.0 = sharp quality
-                                                  final byteData =
-                                                      await image.toByteData(
-                                                          format: ui
-                                                              .ImageByteFormat
-                                                              .png);
-                                                  final pngBytes = byteData!
-                                                      .buffer
-                                                      .asUint8List();
-
-                                                  // 2. PDF banao (exact A4 size)
-                                                  final pdf = pw.Document();
-                                                  final pdfImage =
-                                                      pw.MemoryImage(pngBytes);
-
-                                                  pdf.addPage(
-                                                    pw.Page(
-                                                      pageFormat:
-                                                          PdfPageFormat.a4,
-                                                      margin:
-                                                          pw.EdgeInsets.zero,
-                                                      build:
-                                                          (pw.Context context) {
-                                                        return pw.Center(
-                                                          child: pw.Image(
-                                                              pdfImage,
-                                                              fit: pw.BoxFit
-                                                                  .contain),
-                                                        );
-                                                      },
-                                                    ),
-                                                  );
-
-                                                  final pdfBytes =
-                                                      await pdf.save();
-
-                                                  // 3. File name
-                                                  final now = DateTime.now();
-                                                  final fileName =
-                                                      'taj_royal_contract_${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}.pdf';
-
-                                                  // 4. Share (Web + Mobile dono ke liye perfect)
-                                                  if (kIsWeb) {
-                                                    // Web pe direct download + share
-                                                    await Share.shareXFiles(
-                                                      [
-                                                        XFile.fromData(pdfBytes,
-                                                            mimeType:
-                                                                'application/pdf',
-                                                            name: fileName)
-                                                      ],
-                                                      text:
-                                                          'Taj Royal Glass Co. - Contract Paper',
-                                                    );
-                                                  } else {
-                                                    // Mobile/Desktop
-                                                    final output =
-                                                        await getTemporaryDirectory();
-                                                    final file = File(
-                                                        "${output.path}/$fileName");
-                                                    await file
-                                                        .writeAsBytes(pdfBytes);
-
-                                                    await Share.shareXFiles(
-                                                      [XFile(file.path)],
-                                                      text:
-                                                          'Taj Royal Glass Co. - Contract Paper',
-                                                    );
-                                                  }
-
-                                                  if (context.mounted) {
-                                                    ScaffoldMessenger.of(
-                                                            context)
-                                                        .showSnackBar(
-                                                      const SnackBar(
-                                                          content: Text(
-                                                              'Share sheet opened ✅')),
-                                                    );
-                                                  }
-                                                } catch (e) {
-                                                  print('Share Error: $e');
-                                                  if (context.mounted) {
-                                                    ScaffoldMessenger.of(
-                                                            context)
-                                                        .showSnackBar(
-                                                      SnackBar(
-                                                          content: Text(
-                                                              'Share failed: $e')),
-                                                    );
-                                                  }
-                                                }
-                                              },
-                                            ),
-                                            const SizedBox(height: 20),
-                                            _buildButton(
-                                              "Zoom In",
-                                              Colors.teal,
-                                              _zoomInPage,
-                                            ),
-                                            const SizedBox(height: 20),
-                                            _buildButton(
-                                              "Zoom Out",
-                                              Colors.teal,
-                                              _zoomOutPage,
-                                            ),
-                                            const SizedBox(height: 20),
-                                            _buildButton(
-                                              "Reset Zoom",
-                                              Colors.teal.shade700,
-                                              _resetPageZoom,
-                                            ),
-                                            if (_isProcessing) ...[
-                                              const SizedBox(height: 20),
-                                              const SizedBox(
-                                                width: 22,
-                                                height: 22,
-                                                child:
-                                                    CircularProgressIndicator(
-                                                        strokeWidth: 2),
-                                              ),
-                                            ],
-                                          ],
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
         ),
@@ -4435,11 +3941,19 @@ class _ContractState extends State<Contract> {
   }
 
   Widget _buildFooterQr(String data) {
-    return QrImageView(
-      data: data,
-      version: QrVersions.auto,
-      size: 200,
-      backgroundColor: Colors.white,
+    return Container(
+      padding: const EdgeInsets.all(5),
+      decoration: BoxDecoration(
+        color: currentPaperColor,
+        borderRadius: BorderRadius.circular(5),
+        border: Border.all(color: Colors.black, width: 0.5),
+      ),
+      child: QrImageView(
+        data: data,
+        version: QrVersions.auto,
+        size: 200,
+        backgroundColor: Colors.transparent,
+      ),
     );
   }
 
@@ -4521,24 +4035,6 @@ class _ContractState extends State<Contract> {
         Text("Last Payment:", style: contentStyle),
       ],
     );
-  }
-}
-
-/// Load signature and stamp images from assets for PDF
-Future<void> _loadStampAndSignImages() async {
-  try {
-    final stampData = await rootBundle.load('assets/stamp.png');
-    var _stampImage = pw.MemoryImage(stampData.buffer.asUint8List());
-  } catch (e) {
-    debugPrint('Failed to load stamp.png: $e');
-    var _stampImage = null;
-  }
-  try {
-    final signData = await rootBundle.load('assets/sign.png');
-    var _signImage = pw.MemoryImage(signData.buffer.asUint8List());
-  } catch (e) {
-    debugPrint('Failed to load sign.png: $e');
-    var _signImage = null;
   }
 }
 

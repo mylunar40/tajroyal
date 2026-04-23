@@ -109,6 +109,8 @@ class _LoginPageState extends State<LoginPage> {
 
   Future<void> _openDashboard() async {
     if (!mounted) return;
+    // Load data from Firebase before opening dashboard
+    await Future.delayed(const Duration(milliseconds: 200)); // Small delay
     Navigator.pushReplacement(
       context,
       MaterialPageRoute(builder: (_) => const Dashboard()),
